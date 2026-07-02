@@ -425,210 +425,211 @@ def page_single_device():
     st.warning(analysis.get("analysis_statement", ""))
 
 
-# ── 页面 6：Agent 诊断工作台（多轮对话版）─────────────────────
+# ── 页面 6：Agent 诊断工作台（聊天对话框版）────────────────────
 
-def _init_session():
-    """初始化或获取当前会话 ID。"""
-    if "agent_session_id" not in st.session_state:
-        st.session_state["agent_session_id"] = str(uuid.uuid4())
-    return st.session_state["agent_session_id"]
+QUICK_QUESTIONS = [
+    "帮我分析设备 1000029970",
+    "设备 EX011115 最近有哪些故障？",
+    "当前高风险设备有哪些？",
+    "这批工单整体情况怎么样？",
+    "那它为什么是橙色预警？",
+    "那应该先检查什么？",
+    "那它最近有哪些故障？",
+    "换成 EX011115 呢？",
+]
 
 
-def _new_session():
-    """创建新会话：重新生成 session_id 并清空对话历史。"""
+def _init_agent_session():
+    """初始化 Agent 会话状态（仅在首次进入时执行）。"""
+    defaults = {
+        "agent_session_id": str(uuid.uuid4()),
+        "agent_messages": [],
+        "agent_last_assetnum": None,
+        "agent_last_task_type": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _new_agent_session():
+    """创建新会话：重置 session_id 和全部展示状态。"""
     st.session_state["agent_session_id"] = str(uuid.uuid4())
-    st.session_state["agent_conversation"] = []
+    st.session_state["agent_messages"] = []
     st.session_state["agent_last_assetnum"] = None
     st.session_state["agent_last_task_type"] = None
 
 
-def _get_conversation() -> list[dict]:
-    """获取当前会话的对话历史。"""
-    if "agent_conversation" not in st.session_state:
-        st.session_state["agent_conversation"] = []
-    return st.session_state["agent_conversation"]
+def _handle_agent_query(question: str):
+    """调用后端 Agent，将问答追加到 agent_messages。
+
+    这是前端内部函数，不向用户展示过程。
+    """
+    session_id = st.session_state["agent_session_id"]
+
+    # 1. 追加用户消息
+    st.session_state["agent_messages"].append({
+        "role": "user",
+        "content": question,
+        "meta": None,
+    })
+
+    # 2. 调用后端
+    with st.spinner("Agent 正在诊断中..."):
+        result = agent_diagnose(question, session_id=session_id)
+
+    if result is None:
+        st.session_state["agent_messages"].append({
+            "role": "assistant",
+            "content": "⚠️ 无法连接到后端服务，请确认后端已启动。",
+            "meta": None,
+        })
+        return
+
+    # 3. 更新多轮上下文
+    if result.get("status") == "success":
+        st.session_state["agent_last_assetnum"] = (
+            result.get("last_assetnum") or result.get("assetnum")
+        )
+        st.session_state["agent_last_task_type"] = (
+            result.get("last_task_type") or result.get("task_type")
+        )
+
+    # 4. 追加 assistant 消息（含折叠调试信息）
+    st.session_state["agent_messages"].append({
+        "role": "assistant",
+        "content": result.get("final_answer", "未生成报告"),
+        "meta": {
+            "assetnum": result.get("assetnum"),
+            "task_type": result.get("task_type"),
+            "time_window": result.get("time_window"),
+            "selected_tools": result.get("selected_tools", []),
+            "tool_results": result.get("tool_results", {}),
+            "errors": result.get("errors", []),
+            "session_id": result.get("session_id"),
+            "last_assetnum": result.get("last_assetnum"),
+            "last_task_type": result.get("last_task_type"),
+            "status": result.get("status", "unknown"),
+        },
+    })
+
+
+def _render_assistant_meta(meta: dict):
+    """在 assistant 消息下方折叠展示调试信息。"""
+    if meta is None:
+        return
+
+    # ── 工具轨迹（一行小字，默认折叠） ──
+    selected = meta.get("selected_tools", [])
+    tool_results = meta.get("tool_results", {})
+
+    if selected:
+        tool_labels = []
+        for t in selected:
+            tr = tool_results.get(t, {})
+            icon = "✅" if tr.get("status") == "success" else "❌"
+            tool_labels.append(f"{icon} `{t}`")
+        st.caption(" | ".join(tool_labels))
+
+    # ── 异常（区分"多轮补全提示"和真正错误） ──
+    errors = meta.get("errors", [])
+    if errors:
+        info_errors = [e for e in errors if "多轮" in e or "上下文" in e]
+        real_errors = [e for e in errors if e not in info_errors]
+        for err in info_errors:
+            st.info(f"💡 {err}")
+        for err in real_errors:
+            st.warning(f"⚠️ {err}")
+
+    # ── 折叠调试详情 ──
+    with st.expander("🔍 调试详情", expanded=False):
+        st.markdown("**诊断元信息**")
+        st.text(
+            f"设备编号：{meta.get('assetnum') or '无'}\n"
+            f"任务类型：{meta.get('task_type') or '无'}\n"
+            f"时间窗口：{meta.get('time_window') or '无'}\n"
+            f"Session ID：{meta.get('session_id') or '无'}\n"
+            f"Last Assetnum：{meta.get('last_assetnum') or '无'}\n"
+            f"Last TaskType：{meta.get('last_task_type') or '无'}"
+        )
+
+        if selected:
+            st.markdown("**工具调用轨迹**")
+            for t in selected:
+                tr = tool_results.get(t, {})
+                status = tr.get("status", "unknown")
+                if status == "success":
+                    st.success(f"{t}")
+                elif status == "error":
+                    st.error(f"{t}: {tr.get('message', '')}")
+
+        st.markdown("**工具结果 JSON**")
+        st.json(tool_results)
 
 
 def page_agent_workstation():
-    st.title("🤖 Agent 诊断工作台")
+    # ── 初始化 ──
+    _init_agent_session()
+    session_id = st.session_state["agent_session_id"]
 
-    st.markdown("""
-    本工作台基于 **LangGraph + LangChain Tools** 实现，支持多轮连续对话。
-    Agent 会自动记住上一轮的设备编号，你可以用"它""这个设备"等指代词追问。
-    """)
+    # ═══════════════════════════════════════════════════════════
+    # 顶部状态栏
+    # ═══════════════════════════════════════════════════════════
 
-    # ── 会话管理栏 ──
-    session_id = _init_session()
-    conversation = _get_conversation()
+    st.title("🤖 AFC 智能诊断 Agent")
+    st.caption("支持多轮追问：*它 / 这个设备 / 刚才那个 / 换成 XXX*")
 
-    col_session, col_new, col_info = st.columns([3, 1, 2])
-    with col_session:
-        st.caption(f"📋 会话 ID：`{session_id[:8]}...`")
-    with col_new:
-        if st.button("🆕 新建会话", use_container_width=True):
-            _new_session()
-            st.rerun()
-    with col_info:
+    col_status, col_btn = st.columns([4, 1])
+    with col_status:
         last_asset = st.session_state.get("agent_last_assetnum")
         last_task = st.session_state.get("agent_last_task_type")
-        if last_asset:
-            st.caption(f"📌 当前设备：{last_asset} | 上次任务：{last_task}")
-        else:
-            st.caption("📌 等待首轮对话...")
-
-    st.divider()
-
-    # ── 对话历史展示 ──
-    if conversation:
-        with st.expander(f"💬 对话历史（{len(conversation)} 轮）", expanded=len(conversation) <= 2):
-            for i, turn in enumerate(conversation, 1):
-                with st.chat_message("user"):
-                    st.markdown(f"**第 {i} 轮**：{turn['query']}")
-                with st.chat_message("assistant"):
-                    st.markdown(turn["answer"])
-
-    st.divider()
-
-    # ── 快捷问题模板 ──
-    with st.expander("📋 快捷问题模板"):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.caption("首轮问题（需指定设备）：")
-            if st.button("帮我分析设备 1000029970", key="q1"):
-                st.session_state["agent_input"] = "帮我分析设备 1000029970"
-            if st.button("设备 EX011115 最近有哪些故障？", key="q2"):
-                st.session_state["agent_input"] = "设备 EX011115 最近有哪些故障？"
-        with col_b:
-            st.caption("追问示例（需先完成首轮）：")
-            if st.button("那它为什么是橙色预警？", key="q3"):
-                st.session_state["agent_input"] = "那它为什么是橙色预警？"
-            if st.button("那应该先检查什么？", key="q4"):
-                st.session_state["agent_input"] = "那应该先检查什么？"
-            if st.button("换成 EX011115 呢？", key="q5"):
-                st.session_state["agent_input"] = "换成 EX011115 呢？"
-            if st.button("那它最近有哪些故障？", key="q6"):
-                st.session_state["agent_input"] = "那它最近有哪些故障？"
-
-    # ── 问题输入 ──
-    default_input = st.session_state.get("agent_input", "")
-    question = st.text_area(
-        "💬 请输入你的问题",
-        value=default_input,
-        placeholder=(
-            "首轮：帮我分析设备 1000029970 未来一个月风险高不高\n"
-            "追问：那它应该先检查什么？\n"
-            "切换：换成 EX011115 呢？"
-        ),
-        height=80,
-        key=f"agent_input_area_{session_id[:8]}",
-    )
-
-    # 清空快捷输入（避免重复填充）
-    if default_input and question == default_input:
-        st.session_state.pop("agent_input", None)
-
-    col_btn, col_clear = st.columns([1, 5])
+        asset_text = last_asset if last_asset else "暂无"
+        task_text = last_task if last_task else "暂无"
+        st.markdown(
+            f"📌 当前设备：**{asset_text}**　|　"
+            f"上次任务：**{task_text}**　|　"
+            f"会话：`{session_id[:8]}...`"
+        )
     with col_btn:
-        submit = st.button("🔍 开始诊断", type="primary", use_container_width=True)
-    with col_clear:
-        if st.button("清空输入", use_container_width=False):
-            st.session_state.pop("agent_input", None)
+        if st.button("🆕 新建会话", use_container_width=True):
+            _new_agent_session()
             st.rerun()
 
-    if not submit:
-        # 重渲染后展示上一次结果（如果有）
-        if "agent_last_result" in st.session_state:
-            _display_diagnosis_result(st.session_state["agent_last_result"])
-        return
-
-    if not question.strip():
-        st.warning("请先输入问题。")
-        return
-
-    # ── 调用 Agent ──
-    with st.spinner("Agent 正在诊断中..."):
-        result = agent_diagnose(question.strip(), session_id=session_id)
-
-    if result is None:
-        return
-
-    # ── 保存结果到 session_state（重渲染后依然可显示）──
-    st.session_state["agent_last_result"] = result
-
-    # ── 更新多轮上下文 ──
-    if result.get("status") == "success":
-        st.session_state["agent_last_assetnum"] = result.get("last_assetnum") or result.get("assetnum")
-        st.session_state["agent_last_task_type"] = result.get("last_task_type") or result.get("task_type")
-
-        # 追加对话历史
-        conversation.append({
-            "query": question.strip(),
-            "answer": result.get("final_answer", ""),
-            "task_type": result.get("task_type"),
-            "assetnum": result.get("assetnum"),
-        })
-        st.session_state["agent_conversation"] = conversation
-
-    st.rerun()
-
-
-def _display_diagnosis_result(result: dict):
-    """展示 Agent 诊断结果。"""
     st.divider()
 
-    # 诊断元信息
-    st.subheader("📋 诊断元信息")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        device = result.get("assetnum") or "未识别"
-        st.metric("识别设备", device)
-    with col2:
-        st.metric("任务类型", result.get("task_type", "N/A"))
-    with col3:
-        st.metric("调用工具数", len(result.get("selected_tools", [])))
-    with col4:
-        error_count = len(result.get("errors", []))
-        if error_count > 0:
-            st.error(f"异常：{error_count} 条")
-        else:
-            st.success("无异常")
+    # ═══════════════════════════════════════════════════════════
+    # 快捷问题（直接发送，不填入输入框）
+    # ═══════════════════════════════════════════════════════════
 
-    if result.get("errors"):
-        with st.expander("⚠️ 异常详情"):
-            for err in result["errors"]:
-                st.warning(err)
+    with st.expander("📌 快捷问题", expanded=False):
+        cols = st.columns(4)
+        for i, q in enumerate(QUICK_QUESTIONS):
+            with cols[i % 4]:
+                if st.button(q, key=f"quick_{i}", use_container_width=True):
+                    _handle_agent_query(q)
+                    st.rerun()
 
-    # 工具调用轨迹
-    with st.expander("🔧 工具调用轨迹", expanded=False):
-        selected = result.get("selected_tools", [])
-        tool_results = result.get("tool_results", {})
-        if selected:
-            st.caption(f"共调用 {len(selected)} 个工具：{' → '.join(selected)}")
-            for tool_name in selected:
-                tr = tool_results.get(tool_name, {})
-                status = tr.get("status", "unknown")
-                if status == "success":
-                    st.success(f"✅ {tool_name}")
-                elif status == "error":
-                    st.error(f"❌ {tool_name}: {tr.get('message', '')}")
-                else:
-                    st.info(f"⬜ {tool_name}")
-        else:
-            st.info("未调用工具（可能是全局类问题或无匹配任务）")
+    # ═══════════════════════════════════════════════════════════
+    # 聊天消息流
+    # ═══════════════════════════════════════════════════════════
 
-    # 工具结果 JSON
-    with st.expander("📦 工具结果 JSON", expanded=False):
-        st.json(result.get("tool_results", {}))
+    messages = st.session_state.get("agent_messages", [])
 
-    # 最终诊断报告
-    st.subheader("📝 最终诊断报告")
-    final_answer = result.get("final_answer", "未生成报告")
-    st.markdown(final_answer)
+    for msg in messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("meta"):
+                _render_assistant_meta(msg["meta"])
 
-    # LangSmith Trace
-    st.divider()
-    st.caption("🔍 LangSmith Trace：可在 LangSmith 控制台中查看本次诊断的完整调用链路。")
-    st.caption(f"诊断状态：{result.get('status', 'unknown')}")
+    # ═══════════════════════════════════════════════════════════
+    # 底部聊天输入框
+    # ═══════════════════════════════════════════════════════════
+
+    prompt = st.chat_input("请输入你的问题，例如：帮我分析设备 1000029970")
+
+    if prompt:
+        _handle_agent_query(prompt)
+        st.rerun()
 
 
 # ── 主入口 ────────────────────────────────────────────────────
