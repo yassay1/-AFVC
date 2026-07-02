@@ -3,10 +3,12 @@
 设计原则：
 1. 每个节点只读写自己负责的字段；
 2. 工具结果必须保留，确保最终报告可追溯；
-3. 状态不要太复杂。
+3. 状态不要太复杂；
+4. 多轮对话字段用于 checkpointer 恢复上下文，实现指代补全。
 """
 
 from typing import TypedDict, Optional, Any
+from langchain_core.messages import BaseMessage
 
 
 class AfcAgentState(TypedDict, total=False):
@@ -47,6 +49,13 @@ class AfcAgentState(TypedDict, total=False):
     # ── 异常与可观测 ──
     errors: list[str]
 
+    # ── 多轮对话上下文（checkpointer 持久化）──
+    messages: list[BaseMessage]
+    last_assetnum: Optional[str]
+    last_task_type: Optional[str]
+    last_time_window: Optional[str]
+    last_tool_results_summary: dict[str, Any]
+
 
 def create_initial_state(query: str) -> AfcAgentState:
     """创建一个干净的初始状态。"""
@@ -61,4 +70,9 @@ def create_initial_state(query: str) -> AfcAgentState:
         "evidence": {},
         "final_answer": "",
         "errors": [],
+        "messages": [],
+        "last_assetnum": None,
+        "last_task_type": None,
+        "last_time_window": None,
+        "last_tool_results_summary": {},
     }

@@ -23,28 +23,56 @@ REQUIRED_COLUMNS = [
 
 def get_latest_raw_file() -> Path:
     """
-    获取 backend/data/raw/ 目录下最新上传的工单文件。
+    获取 backend/data/raw/ 目录下的工单文件。
 
-    第一版系统先采用“最新上传文件”作为当前分析对象。
+    优先级：
+    1. 用户上传的最新文件（按修改时间排序）
+    2. 系统默认文件 afc非首次故障-L01线.xlsx
+    3. 以上都不存在时给出明确错误提示
+
     后续可以升级为：
     1. 数据库记录上传批次；
     2. 用户选择指定文件；
     3. 多文件版本管理。
     """
-    if not RAW_DATA_DIR.exists():
-        raise FileNotFoundError("原始数据目录不存在，请先创建 backend/data/raw/ 目录")
+    DEFAULT_DATA_FILE = "afc非首次故障-L01线.xlsx"
 
-    files = [
+    if not RAW_DATA_DIR.exists():
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 收集目录下所有支持的数据文件
+    all_files = [
         file
         for file in RAW_DATA_DIR.iterdir()
         if file.is_file() and file.suffix.lower() in [".xlsx", ".xls", ".csv"]
     ]
 
-    if not files:
-        raise FileNotFoundError("未找到已上传的工单文件，请先调用 /upload/workorders 上传文件")
+    # 1. 分离用户上传文件（带时间戳前缀）和默认文件
+    #    用户上传文件命名规则：YYYYMMDD_HHMMSS_原文件名
+    user_files = [
+        f for f in all_files
+        if f.name != DEFAULT_DATA_FILE
+    ]
 
-    latest_file = max(files, key=lambda file: file.stat().st_mtime)
-    return latest_file
+    if user_files:
+        # 用户上传过文件，取最新
+        latest_file = max(user_files, key=lambda file: file.stat().st_mtime)
+        return latest_file
+
+    # 2. 检查默认文件
+    default_file = RAW_DATA_DIR / DEFAULT_DATA_FILE
+    if default_file.exists():
+        return default_file
+
+    # 3. 如果还有其他文件（非时间戳命名的），也尝试读取
+    if all_files:
+        return max(all_files, key=lambda file: file.stat().st_mtime)
+
+    raise FileNotFoundError(
+        f"未找到工单数据文件。请：\n"
+        f"1. 通过 POST /upload/workorders 上传 AFC 工单 Excel/CSV 文件；或\n"
+        f"2. 将默认数据文件 {DEFAULT_DATA_FILE} 放置到 {RAW_DATA_DIR} 目录下。"
+    )
 
 
 def read_workorder_file(file_path: Path | None = None) -> pl.DataFrame:
@@ -87,7 +115,7 @@ def get_basic_data_info() -> dict[str, Any]:
     返回当前工单数据的基础信息。
 
     注意：
-    这里暂时只做“读取和字段检查”，不做复杂统计。
+    这里暂时只做"读取和字段检查"，不做复杂统计。
     复杂统计会在下一步 /data/summary 中继续完善。
     """
     latest_file = get_latest_raw_file()
@@ -190,7 +218,7 @@ def _get_time_range(df: pl.DataFrame, column: str = "current_faildate") -> dict[
     获取工单记录时间范围。
 
     注意：
-    current_faildate 在本项目中更稳妥地表述为“工单记录时间”，
+    current_faildate 在本项目中更稳妥地表述为"工单记录时间"，
     不直接等同于真实物理故障发生时刻。
     """
     if column not in df.columns:

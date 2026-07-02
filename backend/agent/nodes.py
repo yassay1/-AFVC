@@ -1,10 +1,15 @@
-"""LangGraph 节点实现 —— AFCDiagnosisAgent 的 6 个核心节点。"""
+"""LangGraph 节点实现 —— AFCDiagnosisAgent 的 6 个核心节点。
+
+多轮对话支持：
+- parse_question_node 检测指代词并继承上一轮设备编号
+- generate_report_node 写入多轮摘要字段供下一轮使用
+"""
 
 import json
 import re
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 from backend.agent.state import AfcAgentState
 from backend.agent.prompts import QUESTION_PARSE_PROMPT, REPORT_GENERATION_PROMPT
@@ -27,6 +32,117 @@ TASK_TOOL_MAP: dict[str, list[str]] = {
         "get_maintenance_advice_tool",
     ],
 }
+
+# ── 多轮指代检测 ──────────────────────────────────────────
+
+# 指代词列表：匹配这些词表示用户想指代上一轮的设备
+_REFERENCE_PATTERNS = [
+    r"^那它", r"^它", r"那它", r"它",
+    r"这个设备", r"该设备", r"这设备",
+    r"刚才那个", r"刚才那台", r"刚才的",
+    r"这台", r"那台", r"那一台",
+    r"那应该", r"那这个",
+]
+
+# 设备切换词：匹配这些表示用户想切换到新设备
+_SWITCH_PATTERNS = [
+    r"换成?\s*([A-Za-z0-9]{3,})",
+    r"再看下?\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+    r"切换(?:到|成)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+    r"(?:换|改)(?:成|为|到)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+]
+
+# 全局类问题关键词：不需要设备编号
+_GLOBAL_QUESTION_KEYWORDS = [
+    "整体情况", "概览", "这批工单", "数据怎么样",
+    "高风险设备", "优先巡检", "巡检重点",
+    "今天优先", "当前高风险", "有哪些高风险",
+]
+
+
+def _has_reference_pronoun(query: str) -> bool:
+    """检测问题中是否包含指代词（指代上一轮的设备）。"""
+    for pattern in _REFERENCE_PATTERNS:
+        if re.search(pattern, query):
+            return True
+    return False
+
+
+def _has_device_switch(query: str) -> str | None:
+    """检测问题中是否明确切换了新设备编号，如果是则返回新编号。"""
+    for pattern in _SWITCH_PATTERNS:
+        match = re.search(pattern, query)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _is_global_question(query: str) -> bool:
+    """检测问题是否属于全局类（不需要设备编号）。"""
+    return any(kw in query for kw in _GLOBAL_QUESTION_KEYWORDS)
+
+
+def _resolve_multiturn_context(
+    query: str,
+    last_assetnum: str | None,
+    last_task_type: str | None,
+    last_time_window: str | None,
+) -> tuple[str | None, str | None, str | None, str]:
+    """多轮上下文补全：根据上一轮状态补全当前问题的设备编号。
+
+    规则优先级：
+    1. 如果当前问题明确提到了新设备编号 → 使用新编号（切换设备）
+    2. 如果当前问题是全局类问题 → 不继承设备编号
+    3. 如果当前问题包含指代词 + 有上一轮设备 → 继承上一轮设备
+    4. 其他情况 → 不做处理，走正常解析流程
+
+    Returns:
+        (resolved_assetnum, resolved_task_type, resolved_time_window, hint)
+        hint 是对用户的提示信息，用于嵌入 query 中传给 LLM 解析。
+    """
+    hint = ""
+
+    # 1. 设备切换检测
+    switch_device = _has_device_switch(query)
+    if switch_device:
+        hint = f"[多轮提示] 用户从设备 {last_assetnum} 切换到新设备 {switch_device}"
+        return switch_device, None, None, hint
+
+    # 2. 全局问题不继承
+    if _is_global_question(query):
+        return None, None, None, ""
+
+    # 3. 指代检测
+    if _has_reference_pronoun(query) and last_assetnum:
+        # 推断 task_type
+        inferred_task_type = None
+        inferred_time_window = None
+
+        # "为什么...预警" → risk_explanation
+        if any(w in query for w in ["为什么", "预警", "红色", "橙色", "黄色"]):
+            inferred_task_type = "risk_explanation"
+        # "检查什么" / "怎么处理" / "应该检查" → advice_query
+        elif any(w in query for w in ["检查", "处理", "维修", "修"]):
+            inferred_task_type = "advice_query"
+        # "风险高" / "风险" → risk_query
+        elif any(w in query for w in ["风险"]):
+            inferred_task_type = "risk_query"
+        # "故障" / "历史" → history_query
+        elif any(w in query for w in ["故障", "历史", "以前"]):
+            inferred_task_type = "history_query"
+
+        # 继承上一轮时间窗口
+        if last_time_window:
+            inferred_time_window = last_time_window
+
+        hint = (
+            f"[多轮提示] 用户使用指代词指代上一轮设备 {last_assetnum}，"
+            f"上一轮任务类型为 {last_task_type}。"
+            f"请将 assetnum 解析为 {last_assetnum}。"
+        )
+        return last_assetnum, inferred_task_type, inferred_time_window, hint
+
+    return None, None, None, ""
 
 
 def _clean_json_string(text: str) -> str:
@@ -66,13 +182,36 @@ def parse_question_node(state: AfcAgentState) -> dict[str, Any]:
     - assetnum：设备编号
     - task_type：任务类型
     - time_window：时间窗口
+
+    多轮对话支持：
+    - 检测指代词（它/这个设备/刚才那个等）→ 继承 last_assetnum
+    - 检测设备切换词（换成XXX）→ 更新设备
+    - 全局问题不继承设备编号
     """
     query = state["query"]
-    errors: list[str] = []
+    errors: list[str] = list(state.get("errors", []))
+
+    # ── 多轮上下文补全 ──
+    last_assetnum = state.get("last_assetnum")
+    last_task_type = state.get("last_task_type")
+    last_time_window = state.get("last_time_window")
+
+    resolved_assetnum, resolved_task_type, resolved_time_window, hint = \
+        _resolve_multiturn_context(query, last_assetnum, last_task_type, last_time_window)
+
+    # 如果多轮补全已经确定了 assetnum + task_type，直接使用
+    multiturn_resolved = bool(resolved_assetnum)
 
     try:
         llm = get_parse_llm()
-        prompt = QUESTION_PARSE_PROMPT.format(query=query)
+
+        # 构造 prompt：如果有 hint，在前面加上多轮提示
+        if hint:
+            augmented_query = f"{hint}\n\n用户问题：{query}"
+        else:
+            augmented_query = query
+
+        prompt = QUESTION_PARSE_PROMPT.format(query=augmented_query)
         response = llm.invoke([HumanMessage(content=prompt)])
         raw_output = response.content if hasattr(response, "content") else str(response)
         cleaned = _clean_json_string(raw_output)
@@ -82,9 +221,25 @@ def parse_question_node(state: AfcAgentState) -> dict[str, Any]:
         task_type = parsed.get("task_type", "full_diagnosis")
         time_window = parsed.get("time_window")
 
+        # 如果多轮补全给出了 assetnum 但 LLM 没解析出来，使用补全结果
+        if resolved_assetnum and not assetnum:
+            assetnum = resolved_assetnum
+
+        # 如果多轮补全给出了 task_type 但 LLM 没解析出来，使用补全结果
+        if resolved_task_type and (not task_type or task_type == "full_diagnosis"):
+            task_type = resolved_task_type
+
+        # 如果多轮补全给出了 time_window，优先使用
+        if resolved_time_window and not time_window:
+            time_window = resolved_time_window
+
         # 如果 task_type 不在已知类型中，回退为 full_diagnosis
         if task_type not in TASK_TOOL_MAP:
             task_type = "full_diagnosis"
+
+        # 如果多轮补全生效且 LLM 正常返回，记录提示
+        if multiturn_resolved:
+            errors.append(f"多轮上下文补全：自动关联设备 {resolved_assetnum}")
 
         return {
             "assetnum": assetnum,
@@ -95,27 +250,38 @@ def parse_question_node(state: AfcAgentState) -> dict[str, Any]:
 
     except json.JSONDecodeError:
         # LLM 返回格式异常，使用规则兜底
-        assetnum = _extract_assetnum_from_query(query)
-        task_type = _rule_based_parse_task_type(query)
-        errors.append("LLM 返回非 JSON，已使用规则兜底解析")
+        if multiturn_resolved:
+            # 多轮补全已确定设备，直接用
+            assetnum = resolved_assetnum
+            task_type = resolved_task_type or _rule_based_parse_task_type(query)
+            errors.append("LLM 返回非 JSON，已使用多轮上下文 + 规则兜底解析")
+        else:
+            assetnum = _extract_assetnum_from_query(query)
+            task_type = _rule_based_parse_task_type(query)
+            errors.append("LLM 返回非 JSON，已使用规则兜底解析")
 
         return {
             "assetnum": assetnum,
             "task_type": task_type,
-            "time_window": None,
+            "time_window": resolved_time_window,
             "errors": errors,
         }
 
     except Exception as e:
         # LLM 不可用或其他异常，使用规则兜底
-        assetnum = _extract_assetnum_from_query(query)
-        task_type = _rule_based_parse_task_type(query)
-        errors.append(f"LLM 解析不可用（{str(e)}），已使用规则兜底解析")
+        if multiturn_resolved:
+            assetnum = resolved_assetnum
+            task_type = resolved_task_type or _rule_based_parse_task_type(query)
+            errors.append(f"LLM 解析不可用（{str(e)}），已使用多轮上下文 + 规则兜底解析")
+        else:
+            assetnum = _extract_assetnum_from_query(query)
+            task_type = _rule_based_parse_task_type(query)
+            errors.append(f"LLM 解析不可用（{str(e)}），已使用规则兜底解析")
 
         return {
             "assetnum": assetnum,
             "task_type": task_type,
-            "time_window": None,
+            "time_window": resolved_time_window,
             "errors": errors,
         }
 
@@ -323,11 +489,23 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
 # ── 节点 6：报告生成 ──────────────────────────────────────────
 
 def generate_report_node(state: AfcAgentState) -> dict[str, Any]:
-    """使用 LLM 基于工具证据生成最终诊断报告。"""
+    """使用 LLM 基于工具证据生成最终诊断报告。
+
+    同时写入多轮对话摘要字段，供下一轮对话使用：
+    - last_assetnum: 本轮解析到的设备编号
+    - last_task_type: 本轮任务类型
+    - last_time_window: 本轮时间窗口
+    - last_tool_results_summary: 工具结果摘要（精简版）
+    - messages: 追加本轮用户消息和助手回复
+    """
     query = state["query"]
     evidence = state.get("evidence", {})
+    assetnum = state.get("assetnum")
+    task_type = state.get("task_type")
+    time_window = state.get("time_window")
+    tool_results = state.get("tool_results", {})
 
-    # 尝试使用 LLM 生成
+    # ── 尝试使用 LLM 生成 ──
     try:
         llm = get_report_llm()
         evidence_json = json.dumps(evidence, ensure_ascii=False, indent=2, default=str)
@@ -341,7 +519,55 @@ def generate_report_node(state: AfcAgentState) -> dict[str, Any]:
         # LLM 不可用时使用模板
         final_answer = _template_report(query, evidence)
 
-    return {"final_answer": final_answer}
+    # ── 构建多轮对话摘要 ──
+    last_tool_results_summary = _build_tool_results_summary(tool_results)
+
+    # ── 构建 messages 列表 ──
+    messages = list(state.get("messages", []))
+    messages.append(HumanMessage(content=query))
+    messages.append(AIMessage(content=final_answer))
+
+    return {
+        "final_answer": final_answer,
+        "last_assetnum": assetnum,
+        "last_task_type": task_type,
+        "last_time_window": time_window,
+        "last_tool_results_summary": last_tool_results_summary,
+        "messages": messages,
+    }
+
+
+def _build_tool_results_summary(tool_results: dict[str, Any]) -> dict[str, Any]:
+    """从工具结果中提取精简摘要，供下一轮对话使用。"""
+    summary: dict[str, Any] = {}
+
+    for tool_name, result in tool_results.items():
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") != "success":
+            continue
+
+        # 提取关键信息
+        item: dict[str, Any] = {}
+        if "warning_level" in result:
+            item["warning_level"] = result["warning_level"]
+        if "risk_30d" in result:
+            item["risk_30d"] = result["risk_30d"]
+        if "risk_90d" in result:
+            item["risk_90d"] = result["risk_90d"]
+        if "assetnum" in result:
+            item["assetnum"] = result["assetnum"]
+        if "station_name" in result:
+            item["station_name"] = result["station_name"]
+        if "device_profile" in result:
+            profile = result["device_profile"]
+            item["assetnum"] = item.get("assetnum") or profile.get("assetnum")
+            item["station_name"] = item.get("station_name") or profile.get("station_name")
+
+        if item:
+            summary[tool_name] = item
+
+    return summary
 
 
 def _template_report(query: str, evidence: dict[str, Any]) -> str:

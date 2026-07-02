@@ -12,6 +12,7 @@ from backend.services.data_service import (
     read_workorder_file,
     get_basic_data_info,
     get_data_summary,
+    RAW_DATA_DIR,
 )
 from backend.services.device_service import (
     get_device_list,
@@ -65,6 +66,29 @@ class TestDataService:
         assert metrics["station_count"] > 0
         assert "time_range" in summary
         assert "brand_distribution" in summary
+
+    def test_default_file_exists(self):
+        """默认数据文件应存在于 backend/data/raw/ 目录。"""
+        default_file = RAW_DATA_DIR / "afc非首次故障-L01线.xlsx"
+        assert default_file.exists(), (
+            f"默认数据文件不存在于 {default_file}。"
+            f"请将 afc非首次故障-L01线.xlsx 放置到 {RAW_DATA_DIR} 目录下。"
+        )
+
+    def test_default_file_readable(self):
+        """默认数据文件应可成功读取。"""
+        default_file = RAW_DATA_DIR / "afc非首次故障-L01线.xlsx"
+        if not default_file.exists():
+            pytest.skip("默认数据文件不存在，跳过读取测试")
+        df = read_workorder_file(default_file)
+        assert df.height > 0
+        assert "assetnum" in df.columns
+
+    def test_get_latest_raw_file_finds_default(self):
+        """没有用户上传文件时，应自动使用默认文件。"""
+        file = get_latest_raw_file()
+        assert file.exists()
+        assert file.suffix in [".xlsx", ".xls", ".csv"]
 
 
 # ═══════════════════════════════════════════════════════════════

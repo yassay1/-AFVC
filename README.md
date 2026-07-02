@@ -3,11 +3,12 @@
 面向地铁 AFC（自动售检票）设备的智能运维系统。基于真实故障工单数据，通过 **LangGraph Agent + LangChain Tools** 编排，预测设备复发风险、生成红橙黄绿预警，并提供可解释的诊断报告。
 
 > **项目定位**：面试演示型 MVP，重点在 Agent 工程编排与工具调用闭环，而非预测模型训练。
+> **v0.2.1 更新**：支持多轮对话（LangGraph checkpointer + InMemorySaver），默认接入真实工单数据。
 
 [![Python](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/fastapi-0.139-green)](https://fastapi.tiangolo.com/)
 [![LangGraph](https://img.shields.io/badge/langgraph-1.2.7-orange)](https://langchain-ai.github.io/langgraph/)
-[![Tests](https://img.shields.io/badge/tests-73%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-93%20passed-brightgreen)](tests/)
 
 ---
 
@@ -145,12 +146,34 @@ streamlit run frontend/streamlit_app.py
 ### 4. 使用流程
 
 ```
-1. 打开 Streamlit → 数据上传 → 上传 AFC 工单 Excel
+1. 打开 Streamlit → 数据上传 → 上传 AFC 工单 Excel（可选，已有默认数据）
 2. 数据概览 → 查看 19994 条工单统计
 3. 高风险设备 → 查看 Top N 预警设备
 4. 单设备分析 → 选择设备查看完整分析
-5. Agent 诊断工作台 → 自然语言提问
+5. Agent 诊断工作台 → 自然语言提问，支持多轮连续对话
 ```
+
+### 5. 多轮对话
+
+Agent 工作台支持连续对话，Agent 自动记住上一轮的设备编号：
+
+```
+用户：帮我分析设备 1000029970
+Agent：[返回设备分析报告]
+用户：那它为什么是橙色预警？
+Agent：[自动关联设备 1000029970，返回预警解释]
+用户：那应该先检查什么？
+Agent：[自动关联设备 1000029970，返回维修建议]
+用户：换成 EX011115 呢？
+Agent：[切换到 EX011115，返回新设备分析]
+用户：那它最近有哪些故障？
+Agent：[自动关联设备 EX011115，返回历史工单]
+```
+
+支持的指代词：`它`、`这个设备`、`该设备`、`刚才那个`、`这台`、`那它`、`那应该`
+支持的切换词：`换成XXX`、`改成XXX`、`切换到XXX`
+
+点击 **🆕 新建会话** 可清除对话历史重新开始。
 
 ---
 

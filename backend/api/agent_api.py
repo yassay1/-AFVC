@@ -1,6 +1,7 @@
 """Agent 智能诊断 API —— LangGraph 版。
 
 POST /agent/diagnose → 调用 AFCDiagnosisAgent 工作流。
+支持多轮对话：传入 session_id 可让 Agent 记住上下文。
 """
 
 from pydantic import BaseModel, Field
@@ -16,6 +17,12 @@ class DiagnoseRequest(BaseModel):
         max_length=500,
         description="用户输入的自然语言诊断问题",
     )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="多轮会话 ID。同一 session_id 下 Agent 会记住上一轮的设备和分析结果，支持指代补全（如"那它风险高吗？"）。不传则每次独立诊断。",
+    )
 
 
 class DiagnoseResponse(BaseModel):
@@ -28,6 +35,9 @@ class DiagnoseResponse(BaseModel):
     tool_results: dict = Field(default_factory=dict)
     final_answer: str = ""
     errors: list[str] = Field(default_factory=list)
+    session_id: str | None = None
+    last_assetnum: str | None = None
+    last_task_type: str | None = None
 
 
 router = APIRouter(
@@ -38,15 +48,20 @@ router = APIRouter(
 
 @router.post("/diagnose", response_model=DiagnoseResponse)
 def diagnose(request: DiagnoseRequest):
-    """AFC 智能诊断 Agent 入口（LangGraph 版）。
+    """AFC 智能诊断 Agent 入口（LangGraph 版，支持多轮对话）。
 
     工作流：
-    1. parse_question  → LLM 解析用户问题
+    1. parse_question  → LLM 解析用户问题（多轮模式下继承上下文）
     2. resolve_asset   → 校验设备编号
     3. route_task      → 匹配任务类型 → 选择工具
     4. execute_tools   → 调用 LangChain Tools
     5. merge_evidence  → 整合工具结果为证据
     6. generate_report → LLM / 模板生成诊断报告
+
+    多轮对话：
+    - 传入 session_id 可让 Agent 记住上一轮的设备编号和分析结果
+    - 支持指代补全：用户说"那它风险高吗？"可自动关联上一轮设备
+    - 支持设备切换：用户说"换成 EX011115 呢？"可自动切换设备
 
     支持的问题类型：
     - 数据概览："这批工单整体情况怎么样？"
@@ -62,7 +77,7 @@ def diagnose(request: DiagnoseRequest):
     - 维修建议是巡检方向参考，不是根因诊断结论
     """
     try:
-        result = run_diagnosis(request.query)
+        result = run_diagnosis(request.query, session_id=request.session_id)
         return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))

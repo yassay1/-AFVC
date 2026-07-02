@@ -22,6 +22,8 @@ build/
 backend/data/raw/*.xlsx
 backend/data/raw/*.xls
 backend/data/raw/*.csv
+# 默认数据文件不受上述规则限制
+!backend/data/raw/afc非首次故障-L01线.xlsx
 
 # Streamlit
 .streamlit/
