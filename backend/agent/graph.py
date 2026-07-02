@@ -131,18 +131,8 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
     input_state = {"query": query.strip()}
 
     try:
-        final_state = graph.invoke(input_state, config)
+        final_state = graph.invoke(input_state, config=config)
     except Exception as e:
-        return {
-            "status": "error",
-            "query": query,
-            "assetnum": None,
-            "task_type": None,
-            "selected_tools": [],
-            "tool_results": {},
-            "final_answer": f"Agent 工作流执行异常：{str(e)}",
-            "errors": [str(e)],
-        }
         return {
             "status": "error",
             "query": query,

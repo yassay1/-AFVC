@@ -536,6 +536,9 @@ def page_agent_workstation():
             st.rerun()
 
     if not submit:
+        # 重渲染后展示上一次结果（如果有）
+        if "agent_last_result" in st.session_state:
+            _display_diagnosis_result(st.session_state["agent_last_result"])
         return
 
     if not question.strip():
@@ -548,6 +551,9 @@ def page_agent_workstation():
 
     if result is None:
         return
+
+    # ── 保存结果到 session_state（重渲染后依然可显示）──
+    st.session_state["agent_last_result"] = result
 
     # ── 更新多轮上下文 ──
     if result.get("status") == "success":
@@ -563,10 +569,6 @@ def page_agent_workstation():
         })
         st.session_state["agent_conversation"] = conversation
 
-    # ── 展示诊断结果 ──
-    _display_diagnosis_result(result)
-
-    # 滚动到结果显示区
     st.rerun()
 
 

@@ -21,7 +21,8 @@ class DiagnoseRequest(BaseModel):
         default=None,
         min_length=1,
         max_length=128,
-        description="多轮会话 ID。同一 session_id 下 Agent 会记住上一轮的设备和分析结果，支持指代补全（如"那它风险高吗？"）。不传则每次独立诊断。",
+        description='多轮会话 ID。同一 session_id 下 Agent 会记住上一轮的设备和分析结果，'
+                    '支持指代补全（如"那它风险高吗？"）。不传则每次独立诊断。',
     )
 
 

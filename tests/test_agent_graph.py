@@ -492,5 +492,5 @@ class TestEndToEndWorkflow:
         graph = create_agent_graph()
         state = create_initial_state(f"帮我分析设备 {KNOWN_ASSETNUM}")
         config = {"configurable": {"thread_id": "test-graph-invoke"}}
-        final_state = graph.invoke(state, config)
+        final_state = graph.invoke(state, config=config)
         assert len(final_state["final_answer"]) > 0
