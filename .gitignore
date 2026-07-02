@@ -1,0 +1,31 @@
+# Python虚拟环境
+.venv/
+
+# 环境变量（含API Key）
+.env
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 上传的原始数据文件（太大，且含真实地铁数据）
+backend/data/raw/*.xlsx
+backend/data/raw/*.xls
+backend/data/raw/*.csv
+
+# Streamlit
+.streamlit/
+
+# 系统文件
+.DS_Store
+Thumbs.db

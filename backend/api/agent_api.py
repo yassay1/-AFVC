@@ -1,0 +1,77 @@
+"""Agent 智能诊断 API —— LangGraph 版。
+
+POST /agent/diagnose → 调用 AFCDiagnosisAgent 工作流。
+"""
+
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException
+
+from backend.agent.graph import run_diagnosis
+
+
+class DiagnoseRequest(BaseModel):
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="用户输入的自然语言诊断问题",
+    )
+
+
+class DiagnoseResponse(BaseModel):
+    status: str
+    query: str
+    assetnum: str | None = None
+    task_type: str | None = None
+    time_window: str | None = None
+    selected_tools: list[str] = Field(default_factory=list)
+    tool_results: dict = Field(default_factory=dict)
+    final_answer: str = ""
+    errors: list[str] = Field(default_factory=list)
+
+
+router = APIRouter(
+    prefix="/agent",
+    tags=["Agent 智能诊断"],
+)
+
+
+@router.post("/diagnose", response_model=DiagnoseResponse)
+def diagnose(request: DiagnoseRequest):
+    """AFC 智能诊断 Agent 入口（LangGraph 版）。
+
+    工作流：
+    1. parse_question  → LLM 解析用户问题
+    2. resolve_asset   → 校验设备编号
+    3. route_task      → 匹配任务类型 → 选择工具
+    4. execute_tools   → 调用 LangChain Tools
+    5. merge_evidence  → 整合工具结果为证据
+    6. generate_report → LLM / 模板生成诊断报告
+
+    支持的问题类型：
+    - 数据概览："这批工单整体情况怎么样？"
+    - 高风险设备："今天优先巡检哪些设备？"
+    - 单设备分析："帮我分析设备 1000029970"
+    - 风险查询："设备 1000029970 未来 30 天风险高吗？"
+    - 历史查询："设备 1000029970 最近有哪些故障？"
+    - 维修建议："设备 1000029970 建议检查什么？"
+    - 预警解释："为什么设备 1000029970 是红色预警？"
+
+    科学边界：
+    - 风险预测表示再次产生故障工单的风险，不等同于物理故障预测
+    - 维修建议是巡检方向参考，不是根因诊断结论
+    """
+    try:
+        result = run_diagnosis(request.query)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Agent 服务不可用：{str(e)}。请确认 .env 中 OPENAI_API_KEY 已配置。",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent 诊断异常：{str(e)}")
