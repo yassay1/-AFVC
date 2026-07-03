@@ -97,7 +97,12 @@ class TestRuleBasedParsing:
         assert _rule_based_parse_task_type("设备 100023 风险高不高，应该检查什么") == "risk_and_advice_query"
 
     def test_parse_task_type_fallback(self):
-        assert _rule_based_parse_task_type("你好") == "full_diagnosis"
+        # "你好" 等问候/能力询问应识别为 capability_query
+        assert _rule_based_parse_task_type("你好") == "capability_query"
+        assert _rule_based_parse_task_type("你会干什么") == "capability_query"
+        assert _rule_based_parse_task_type("有什么功能") == "capability_query"
+        # 真正无意义的输入才回退到 full_diagnosis
+        assert _rule_based_parse_task_type("xyz123") == "full_diagnosis"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -494,3 +499,114 @@ class TestEndToEndWorkflow:
         config = {"configurable": {"thread_id": "test-graph-invoke"}}
         final_state = graph.invoke(state, config=config)
         assert len(final_state["final_answer"]) > 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 新三节点混合型 Agent 验收场景
+# ═══════════════════════════════════════════════════════════════
+
+class TestHybridAgentAcceptance:
+
+    def test_capability_query_does_not_call_business_tools(self):
+        result = run_diagnosis("你会干什么？", session_id="accept-capability")
+        assert result["status"] == "success"
+        assert result["task_type"] == "capability_query"
+        assert result["selected_tools"] == []
+        assert result["tool_results"] == {}
+        assert "功能介绍" in result["final_answer"]
+
+    def test_data_overview_report_matches_tool(self):
+        result = run_diagnosis("这批工单整体情况怎么样？", session_id="accept-overview")
+        assert result["status"] == "success"
+        assert result["task_type"] == "data_overview"
+        assert result["selected_tools"] == ["get_data_summary_tool"]
+        assert "get_data_summary_tool" in result["tool_results"]
+        assert "设备编号 None" not in result["final_answer"]
+        assert "风险：N/A" not in result["final_answer"]
+
+    def test_high_risk_devices_tool_and_report(self):
+        result = run_diagnosis("当前高风险设备有哪些？", session_id="accept-high-risk")
+        assert result["status"] == "success"
+        assert result["task_type"] == "high_risk_ranking"
+        assert result["selected_tools"] == ["get_high_risk_devices_tool"]
+        assert result["tool_results"]["get_high_risk_devices_tool"]["status"] == "success"
+        assert "高风险" in result["final_answer"] or "巡检" in result["final_answer"]
+
+    def test_full_diagnosis_uses_integrated_analysis(self):
+        result = run_diagnosis(f"帮我分析设备 {KNOWN_ASSETNUM}", session_id="accept-full")
+        assert result["status"] == "success"
+        assert result["assetnum"] == KNOWN_ASSETNUM
+        assert "get_integrated_analysis_tool" in result["selected_tools"]
+        assert "科学边界" in result["final_answer"]
+
+    def test_risk_query_does_not_call_data_overview(self):
+        result = run_diagnosis(f"设备 {KNOWN_ASSETNUM} 未来 30 天风险高吗？", session_id="accept-risk")
+        assert result["status"] == "success"
+        assert result["task_type"] == "risk_query"
+        assert "predict_device_risk_tool" in result["selected_tools"]
+        assert "get_data_summary_tool" not in result["selected_tools"]
+
+    def test_advice_query_uses_advice_tool(self):
+        result = run_diagnosis(f"设备 {KNOWN_ASSETNUM} 应该先检查什么？", session_id="accept-advice")
+        assert result["status"] == "success"
+        assert result["task_type"] == "advice_query"
+        assert "get_maintenance_advice_tool" in result["selected_tools"]
+
+    def test_risk_and_advice_uses_multiple_tools(self):
+        result = run_diagnosis(
+            f"设备 {KNOWN_ASSETNUM} 风险高不高，高的话应该先检查什么？",
+            session_id="accept-risk-advice",
+        )
+        assert result["status"] == "success"
+        assert result["task_type"] == "risk_and_advice_query"
+        assert "predict_device_risk_tool" in result["selected_tools"]
+        assert "get_maintenance_advice_tool" in result["selected_tools"]
+
+    def test_pronoun_inherits_asset_for_warning_explanation(self):
+        sid = "accept-pronoun-warning"
+        run_diagnosis(f"帮我分析设备 {KNOWN_ASSETNUM}", session_id=sid)
+        result = run_diagnosis("那它为什么是橙色预警？", session_id=sid)
+        assert result["status"] == "success"
+        assert result["assetnum"] == KNOWN_ASSETNUM
+        assert result["task_type"] == "risk_explanation"
+
+    def test_missing_asset_without_context_is_friendly(self):
+        result = run_diagnosis("帮我分析一下", session_id="accept-missing-asset")
+        assert result["status"] == "success"
+        assert result["asset_exists"] is False
+        assert result["selected_tools"] == []
+        assert "未能从您的问题中识别到设备编号" in result["final_answer"]
+
+    def test_unknown_device_does_not_call_business_tools(self):
+        result = run_diagnosis("帮我分析设备 ZZZ99999", session_id="accept-unknown-device")
+        assert result["status"] == "success"
+        assert result["asset_exists"] is False
+        assert result["selected_tools"] == []
+        assert "未找到" in result["final_answer"] or "不存在" in result["final_answer"]
+
+    def test_device_switch_updates_context(self):
+        sid = "accept-switch"
+        run_diagnosis(f"帮我分析设备 {KNOWN_ASSETNUM}", session_id=sid)
+        switched = run_diagnosis(f"换成 {SECOND_ASSETNUM} 呢？", session_id=sid)
+        assert switched["assetnum"] == SECOND_ASSETNUM
+        followup = run_diagnosis("那它未来 30 天风险高吗？", session_id=sid)
+        assert followup["assetnum"] == SECOND_ASSETNUM
+        assert followup["task_type"] == "risk_query"
+
+    def test_current_turn_debug_fields_do_not_leak(self):
+        sid = "accept-no-leak"
+        first = run_diagnosis("帮我分析一下", session_id=sid)
+        assert first["errors"]
+        second = run_diagnosis("你会干什么？", session_id=sid)
+        assert second["task_type"] == "capability_query"
+        assert second["selected_tools"] == []
+        assert second["tool_results"] == {}
+        assert not any("未从问题中识别到设备编号" in err for err in second["errors"])
+
+    def test_different_session_context_isolated_for_missing_pronoun(self):
+        sid_a = "accept-isolated-a"
+        sid_b = "accept-isolated-b"
+        run_diagnosis(f"帮我分析设备 {KNOWN_ASSETNUM}", session_id=sid_a)
+        result_b = run_diagnosis("那应该先检查什么？", session_id=sid_b)
+        assert result_b["asset_exists"] is False
+        assert result_b["assetnum"] is None

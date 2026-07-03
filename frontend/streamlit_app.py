@@ -130,7 +130,10 @@ def page_home():
     with col2:
         st.metric("Agent 架构", "LangGraph + Tools")
     with col3:
-        st.metric("当前阶段", "MVP 演示版 v0.2")
+        # 尝试读取后端版本号
+        health = api_get("/health")
+        version = health.get("version", "0.2") if health else "0.2"
+        st.metric("当前阶段", f"MVP 演示版 v{version}")
 
     st.subheader("系统流程")
     steps = st.columns(5)
@@ -376,8 +379,6 @@ def page_single_device():
     ]
     for label, val in risk_levels:
         v = float(val) if val else 0
-        bar_color = "normal" if v < 0.35 else ("normal" if v < 0.55 else "orange" if v < 0.75 else "red")
-        # Streamlit progress bar doesn't support color, use the bar with label
         st.progress(min(v, 1.0), text=f"{label}风险：{v}")
 
     warning_level = risk.get("warning_level", "-")
@@ -503,8 +504,11 @@ def _handle_agent_query(question: str):
             "assetnum": result.get("assetnum"),
             "task_type": result.get("task_type"),
             "time_window": result.get("time_window"),
+            "intent": result.get("intent", {}),
             "selected_tools": result.get("selected_tools", []),
             "tool_results": result.get("tool_results", {}),
+            "tool_trace": result.get("tool_trace", []),
+            "evidence": result.get("evidence", {}),
             "errors": result.get("errors", []),
             "session_id": result.get("session_id"),
             "last_assetnum": result.get("last_assetnum"),
@@ -555,16 +559,27 @@ def _render_assistant_meta(meta: dict):
 
         if selected:
             st.markdown("**工具调用轨迹**")
+            trace_by_tool = {
+                item.get("tool"): item
+                for item in meta.get("tool_trace", [])
+                if isinstance(item, dict)
+            }
             for t in selected:
                 tr = tool_results.get(t, {})
+                trace = trace_by_tool.get(t, {})
                 status = tr.get("status", "unknown")
                 if status == "success":
                     st.success(f"{t}")
                 elif status == "error":
                     st.error(f"{t}: {tr.get('message', '')}")
+                elif trace:
+                    st.info(f"{t}: {trace.get('status', 'unknown')}")
 
         st.markdown("**工具结果 JSON**")
         st.json(tool_results)
+        if meta.get("tool_trace"):
+            st.markdown("**工具轨迹 JSON**")
+            st.json(meta.get("tool_trace"))
 
 
 def page_agent_workstation():
@@ -635,8 +650,11 @@ def page_agent_workstation():
 # ── 主入口 ────────────────────────────────────────────────────
 
 def main():
+    # 尝试读取后端版本号
+    health = api_get("/health")
+    version = health.get("version", "0.2.0") if health else "0.2.0"
     st.sidebar.title("AFC 智能系统")
-    st.sidebar.caption("v0.2.0 · LangGraph + Tools")
+    st.sidebar.caption(f"v{version} · LangGraph + Tools")
     show_backend_status()
 
     page = st.sidebar.radio(

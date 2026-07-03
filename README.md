@@ -269,3 +269,14 @@ pytest tests/ -v
 | 数据存储 | 文件系统 | PostgreSQL / MySQL |
 | 前端 | Streamlit | 可升级 React/Vue |
 | 部署 | 本地 | Docker + 云部署 |
+
+---
+
+## 文档
+
+详细架构设计和项目说明请查看 `docs/` 目录：
+
+| 文档 | 说明 |
+|------|------|
+| [docs/architecture.md](docs/architecture.md) | 系统架构、Agent 工作流、工具与服务层设计 |
+| [docs/project-brief.md](docs/project-brief.md) | 项目定位、用户场景、面试讲解口径 |

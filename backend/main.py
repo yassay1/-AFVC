@@ -4,6 +4,7 @@
     python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,15 @@ from backend.core.config import (
     LANGSMITH_API_KEY,
     LANGSMITH_PROJECT,
 )
+
+# ── 日志 ──────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("afc_agent")
 
 # ── LangSmith 初始化 ──────────────────────────────────────────
 
@@ -35,8 +45,10 @@ async def lifespan(app: FastAPI):
     from pathlib import Path
     raw_dir = Path(__file__).parent / "data" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("AFC 智能系统 v%s 启动，数据目录：%s", PROJECT_VERSION, raw_dir)
     yield
-    # 关闭时（暂无操作）
+    # 关闭时
+    logger.info("AFC 智能系统关闭")
 
 
 # ── FastAPI 应用 ──────────────────────────────────────────────

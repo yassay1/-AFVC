@@ -29,11 +29,17 @@ class DiagnoseRequest(BaseModel):
 class DiagnoseResponse(BaseModel):
     status: str
     query: str
+    intent: dict = Field(default_factory=dict)
     assetnum: str | None = None
     task_type: str | None = None
     time_window: str | None = None
+    requires_asset: bool | None = None
+    is_global: bool | None = None
+    asset_exists: bool | None = None
     selected_tools: list[str] = Field(default_factory=list)
     tool_results: dict = Field(default_factory=dict)
+    tool_trace: list[dict] = Field(default_factory=list)
+    evidence: dict = Field(default_factory=dict)
     final_answer: str = ""
     errors: list[str] = Field(default_factory=list)
     session_id: str | None = None
