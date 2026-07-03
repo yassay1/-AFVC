@@ -1,14 +1,46 @@
 # 🚇 AFC 故障复发风险预测与智能维修建议系统
 
-面向地铁 AFC（自动售检票）设备的智能运维系统。基于真实故障工单数据，通过 **LangGraph Agent + LangChain Tools** 编排，预测设备复发风险、生成红橙黄绿预警，并提供可解释的诊断报告。
+面向地铁 AFC（自动售检票）设备的智能运维系统。基于真实故障工单数据，通过 **LLM-driven Context-Aware Tool Agent（LangGraph 八节点 + LangChain Tools + RAG）** 编排，预测设备复发风险、生成红橙黄绿预警，并提供可解释的诊断报告。
 
 > **项目定位**：面试演示型 MVP，重点在 Agent 工程编排与工具调用闭环，而非预测模型训练。
-> **v0.2.1 更新**：支持多轮对话（LangGraph checkpointer + InMemorySaver），默认接入真实工单数据。
+> **v0.3 更新**：Agent 从三节点升级为八节点 LLM-driven 架构，LLM 承担四个角色（Query Understanding / Tool Planning / Evidence Evaluation / Answer Generation），新增维修手册 RAG 检索工具。
 
 [![Python](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/fastapi-0.139-green)](https://fastapi.tiangolo.com/)
 [![LangGraph](https://img.shields.io/badge/langgraph-1.2.7-orange)](https://langchain-ai.github.io/langgraph/)
-[![Tests](https://img.shields.io/badge/tests-93%20passed-brightgreen)](tests/)
+
+---
+
+## Agent 架构升级（v0.2 → v0.3/v0.4）
+
+```
+v0.2 三节点：                    v0.3/v0.4 八节点：
+parse_intent                     prepare_context     → 整理上下文
+   ↓                             understand_query    → LLM 理解问题
+reason_act                       plan_tools          → LLM 规划工具
+   ↓                             execute_tools       → 执行工具
+generate_report                  merge_evidence      → 合并证据
+                                 evaluate_evidence   → LLM 评估证据
+                                    ├── 不足 → 补充工具（最多 2 轮）
+                                    └── 足够 → generate_answer  → LLM 生成回答
+                                 update_memory       → 更新记忆
+```
+
+### LLM 四个角色
+
+| 角色 | 节点 | 职责 |
+|------|------|------|
+| Query Understanding | understand_query | 结构化理解问题（含指代消解、设备切换） |
+| Tool Planning | plan_tools | 解释 why→plan→expected evidence |
+| Evidence Evaluation | evaluate_evidence | 判断证据是否足够，不足则建议补充 |
+| Answer Generation | generate_answer | 基于 EvidencePacket 生成受约束回答 |
+
+### 核心原则
+
+- **LLM 不直接编造答案**：所有风险数值、设备信息、历史工单和维修建议都来自工具结果
+- **RAG 是按需工具**：维修手册由 plan_tools / evaluate_evidence 决定是否调用
+- **证据包约束回答**：generate_answer_node 只能基于 EvidencePacket 回答
+- **结构化输出工程**：LLM JSON 经过 extract → json.loads → Pydantic → repair 四步处理
 
 ---
 
@@ -18,78 +50,50 @@
 afc_fault_agent_system/
 ├── backend/
 │   ├── main.py                     # FastAPI 入口
-│   ├── api/                        # API 路由层
-│   │   ├── upload_api.py           # 工单上传
-│   │   ├── data_api.py             # 数据概览
-│   │   ├── device_api.py           # 设备管理
-│   │   ├── predict_api.py          # 风险预测
-│   │   ├── advice_api.py           # 维修建议
-│   │   ├── analysis_api.py         # 综合分析
-│   │   └── agent_api.py            # Agent 诊断 (LangGraph)
+│   ├── api/                        # API 路由层（7 路由）
 │   ├── agent/                      # Agent 编排层 ★
-│   │   ├── state.py                # AfcAgentState 定义
-│   │   ├── tools.py                # 8 个 LangChain Tools
+│   │   ├── state.py                # AfcAgentState（v0.3 升级版）
+│   │   ├── schemas.py              # 新：所有 Pydantic Schema
+│   │   ├── llm_json.py             # 新：结构化 JSON 输出工具
+│   │   ├── tools.py                # 9 个 LangChain Tools（含 RAG）
 │   │   ├── prompts.py              # LLM Prompt 模板
-│   │   ├── nodes.py                # 6 个 LangGraph 节点
-│   │   ├── graph.py                # 工作流编排 + 入口
-│   │   └── report_builder.py       # 报告生成器（模板兜底）
-│   ├── services/                   # 业务服务层
-│   │   ├── data_service.py         # 工单数据读取
-│   │   ├── device_service.py       # 设备查询
-│   │   ├── prediction_service.py   # 风险预测
-│   │   ├── warning_service.py      # 预警等级
-│   │   ├── advice_service.py       # 维修建议
-│   │   ├── analysis_service.py     # 综合分析
-│   │   └── model_adapter.py        # 外部模型适配
-│   ├── core/                       # 核心配置
-│   │   ├── config.py               # 环境变量
-│   │   └── llm.py                  # LLM 统一封装
+│   │   ├── graph.py                # 八节点 LangGraph 工作流
+│   │   ├── report_builder.py       # 报告生成器（模板兜底）
+│   │   └── nodes/                  # 新：拆分后节点实现
+│   │       ├── prepare_context.py
+│   │       ├── understand_query.py
+│   │       ├── plan_tools.py
+│   │       ├── execute_tools.py
+│   │       ├── merge_evidence.py
+│   │       ├── evaluate_evidence.py
+│   │       ├── generate_answer.py
+│   │       ├── update_memory.py
+│   │       └── compat.py           # 向后兼容旧三节点 API
+│   ├── services/                   # 业务服务层（8 服务）
+│   │   ├── rag_service.py          # 新：维修手册 RAG 检索
+│   │   └── ...
+│   ├── core/                       # 核心配置 + LLM 封装
 │   └── data/                       # 数据文件
 │       ├── raw/                    # 上传的原始工单
 │       ├── mock/                   # 外部预测结果 CSV
-│       └── knowledge/              # 后续知识库
+│       └── knowledge/manuals/      # 维修手册知识库
 ├── frontend/
 │   └── streamlit_app.py            # Streamlit 前端（6 页面）
 ├── tests/
-│   ├── test_services.py            # Service 层测试（22 用例）
-│   ├── test_agent_tools.py         # Tools 层测试（16 用例）
-│   └── test_agent_graph.py         # Agent 工作流测试（35 用例）
-├── docs/                           # 参考文档
-├── .env.example                    # 环境变量模板
+│   ├── test_services.py
+│   ├── test_agent_tools.py
+│   ├── test_agent_graph.py         # 兼容旧三节点测试
+│   ├── test_agent_v03_nodes.py     # 新：八节点单元测试
+│   ├── test_agent_v03_graph.py     # 新：八节点端到端测试
+│   ├── test_llm_json.py            # 新：LLM JSON 工具测试
+│   └── test_rag_service.py         # 新：RAG 服务测试
+├── docs/
+│   ├── architecture.md
+│   └── project-brief.md
+├── .env.example
 ├── requirements.txt
 └── README.md
 ```
-
----
-
-## 架构
-
-```
-Streamlit 前端 (6 页面)
-    ↓ HTTP REST API
-FastAPI API 层
-    ↓
-AFCDiagnosisAgent (LangGraph)
-    ├── parse_question_node  ── LLM / 规则兜底
-    ├── resolve_asset_node   ── 设备校验
-    ├── route_task_node      ── 7 种任务类型 → 工具选择
-    ├── execute_tools_node   ── 调用 LangChain Tools
-    ├── merge_evidence_node  ── 证据整合
-    └── generate_report_node ── LLM / 模板兜底
-         ↓
-LangChain Tools (8 个)
-    ↓
-Service 层 (7 个业务服务)
-    ↓
-工单数据 / 预测结果 CSV
-```
-
-### 设计原则
-
-- **只有一个 `AFCDiagnosisAgent`**，不做多子 Agent
-- **Agent 只通过 Tools 访问业务能力**，不直接读文件/操作 DataFrame
-- **LLM 只负责解析问题和生成报告**，风险值/预警/设备信息必须来自工具结果
-- **外挂模型适配器**，Mock 预测和真实模型用同一接口
 
 ---
 
@@ -140,22 +144,7 @@ python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 streamlit run frontend/streamlit_app.py
 ```
 
-- 后端 API 文档：http://127.0.0.1:8000/docs
-- 前端页面：http://localhost:8501
-
-### 4. 使用流程
-
-```
-1. 打开 Streamlit → 数据上传 → 上传 AFC 工单 Excel（可选，已有默认数据）
-2. 数据概览 → 查看 19994 条工单统计
-3. 高风险设备 → 查看 Top N 预警设备
-4. 单设备分析 → 选择设备查看完整分析
-5. Agent 诊断工作台 → 自然语言提问，支持多轮连续对话
-```
-
-### 5. 多轮对话
-
-Agent 工作台支持连续对话，Agent 自动记住上一轮的设备编号：
+### 4. 多轮对话示例
 
 ```
 用户：帮我分析设备 1000029970
@@ -164,16 +153,11 @@ Agent：[返回设备分析报告]
 Agent：[自动关联设备 1000029970，返回预警解释]
 用户：那应该先检查什么？
 Agent：[自动关联设备 1000029970，返回维修建议]
+用户：按维修手册说应该先查哪里？
+Agent：[调用 RAG 检索维修手册，返回检查步骤]
 用户：换成 EX011115 呢？
 Agent：[切换到 EX011115，返回新设备分析]
-用户：那它最近有哪些故障？
-Agent：[自动关联设备 EX011115，返回历史工单]
 ```
-
-支持的指代词：`它`、`这个设备`、`该设备`、`刚才那个`、`这台`、`那它`、`那应该`
-支持的切换词：`换成XXX`、`改成XXX`、`切换到XXX`
-
-点击 **🆕 新建会话** 可清除对话历史重新开始。
 
 ---
 
@@ -190,36 +174,26 @@ Agent：[自动关联设备 EX011115，返回历史工单]
 | `GET` | `/predict/{assetnum}` | 单设备风险预测 |
 | `GET` | `/advice/{assetnum}` | 维修建议 |
 | `GET` | `/analysis/{assetnum}?history_limit=50` | 单设备综合分析 |
-| `POST` | `/agent/diagnose` | Agent 智能诊断 (LangGraph) |
+| `POST` | `/agent/diagnose` | Agent 智能诊断（v0.3 八节点） |
 
 ---
 
-## Agent 支持的问题类型
+## Agent 支持的问题类型（12 种）
 
 | 类型 | 示例 | 调用工具 |
 |------|------|----------|
+| `capability_query` | "你会干什么？" | — |
 | `data_overview` | "这批工单整体情况怎么样？" | data_summary |
 | `high_risk_ranking` | "当前高风险设备有哪些？" | high_risk_devices |
 | `full_diagnosis` | "帮我分析设备 1000029970" | integrated_analysis |
-| `risk_query` | "设备 1000029970 未来 30 天风险高吗？" | predict_device_risk |
+| `risk_query` | "设备 1000029970 未来30天风险高吗？" | predict_device_risk |
 | `advice_query` | "设备 1000029970 建议检查什么？" | maintenance_advice |
 | `history_query` | "设备 1000029970 最近有哪些故障？" | device_history |
-| `risk_explanation` | "为什么设备 1000029970 是红色预警？" | predict + advice |
-| `risk_and_advice_query` | "风险高不高，应该检查什么？" | history + predict + advice |
-
----
-
-## 运行测试
-
-```bash
-pytest tests/ -v
-```
-
-```
-73 passed in X.XXs
-```
-
-测试覆盖：Service 层 (22) + Tools 层 (16) + Agent 工作流 (35)
+| `risk_explanation` | "为什么是橙色预警？" | predict_device_risk |
+| `risk_and_advice_query` | "风险高不高？应该检查什么？" | predict + advice |
+| `manual_query` | "按维修手册应该查哪里？" | **search_maintenance_manual** |
+| `followup_rewrite` | "换成 EX011115 呢？" | 继承上下文 |
+| `unknown` | — | 兜底 full_diagnosis |
 
 ---
 
@@ -230,42 +204,32 @@ pytest tests/ -v
 | 后端框架 | FastAPI + Uvicorn |
 | 前端 | Streamlit |
 | Agent 编排 | LangGraph |
-| Agent 工具 | LangChain Tools |
-| LLM | OpenAI-compatible (ChatOpenAI) |
-| 可观测 | LangSmith |
+| Agent 工具 | LangChain Tools (9 个) |
+| LLM | OpenAI-compatible API |
+| RAG | 关键词匹配 + 段落切分（后续升级向量数据库） |
+| 可观测 | LangSmith (可选) |
 | 数据处理 | Polars |
 | 数据校验 | Pydantic |
-| 数据科学 | Pandas / Altair |
-
----
-
-## 预警规则
-
-| 等级 | 条件 | 建议巡检窗口 |
-|------|------|-------------|
-| 🔴 红色预警 | risk_30d ≥ 0.75 或 risk_90d ≥ 0.90 | 3～7 天内 |
-| 🟠 橙色预警 | risk_30d ≥ 0.55 或 risk_90d ≥ 0.75 | 7～14 天内 |
-| 🟡 黄色预警 | risk_30d ≥ 0.35 或 risk_90d ≥ 0.55 | 14～30 天内 |
-| 🟢 绿色关注 | 其他 | 常规周期 |
 
 ---
 
 ## 科学边界
 
 1. `current_faildate` 表示工单记录时间，不一定等于物理故障发生时刻
-2. 风险预测表示未来时间窗口内再次产生故障工单的风险，不等于设备一定会在某天发生故障
-3. 维修建议是巡检方向参考，不是最终根因诊断结论
-4. 最终维修判断仍需结合现场检测、设备日志和人工经验
+2. **不能预测具体故障日期**，只能给风险窗口
+3. 维修建议是巡检方向参考，**不是最终根因诊断结论**
+4. RAG 检索的维修手册内容来自演示用示例文件
+5. 最终维修判断仍需结合现场检测、设备日志和人工经验
 
 ---
 
 ## 后续升级方向
 
-| 模块 | 当前 | 计划 |
-|------|------|------|
-| 预测模型 | Mock + 外部 CSV | 接入队友真实 ML 模型 |
-| Agent | 规则路由 + LLM 解析/报告 | LangGraph tool-calling Agent |
-| RAG | 预留接口 | 维修手册向量检索 |
+| 模块 | 当前（v0.3） | 计划 |
+|------|-------------|------|
+| 预测模型 | Mock + 外部 CSV | 接入真实 ML 模型 |
+| Agent | 八节点 LLM-driven Tool Agent | tool-calling Agent + multi-agent |
+| RAG | 关键词匹配 .txt/.md | 向量数据库 + embedding（ChromaDB/FAISS） |
 | 数据存储 | 文件系统 | PostgreSQL / MySQL |
 | 前端 | Streamlit | 可升级 React/Vue |
 | 部署 | 本地 | Docker + 云部署 |
@@ -273,8 +237,6 @@ pytest tests/ -v
 ---
 
 ## 文档
-
-详细架构设计和项目说明请查看 `docs/` 目录：
 
 | 文档 | 说明 |
 |------|------|

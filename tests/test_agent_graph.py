@@ -31,6 +31,8 @@ from backend.agent.nodes import (
 KNOWN_ASSETNUM = "1000029970"
 SECOND_ASSETNUM = "EX011115"
 
+pytestmark = pytest.mark.legacy
+
 
 # ═══════════════════════════════════════════════════════════════
 # State 测试

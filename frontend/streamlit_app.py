@@ -111,15 +111,19 @@ def page_home():
     st.title("🚇 AFC 故障复发风险预测与智能维修建议系统")
 
     st.markdown("""
-    本系统面向地铁 AFC 闸机维修工单数据，基于 **LangGraph + LangChain Tools** 架构：
+    本系统面向地铁 AFC 闸机维修工单数据，基于 **LangGraph + LangChain Tools + RAG** 架构：
 
     1. 工单数据上传与读取
     2. 数据概览统计
     3. 设备历史工单查询
     4. 高风险设备 Top N 展示
     5. 单设备多时间窗口风险预测
-    6. 维修建议生成
-    7. **Agent 智能诊断工作台**（LangGraph 编排 + LLM + 工具调用）
+    6. 维修建议生成 + 维修手册 RAG 检索
+    7. **Agent 智能诊断工作台**（LLM-driven Context-Aware Tool Agent）
+       - 八节点 LangGraph 流程：prepare_context → understand_query → plan_tools
+         → execute_tools → merge_evidence → evaluate_evidence → generate_answer → update_memory
+       - LLM 四个角色：Query Understanding / Tool Planning / Evidence Evaluation / Answer Generation
+       - 支持多轮对话、指代消解、设备切换、维修手册 RAG 检索
 
     ---
     """)
@@ -135,13 +139,13 @@ def page_home():
         version = health.get("version", "0.2") if health else "0.2"
         st.metric("当前阶段", f"MVP 演示版 v{version}")
 
-    st.subheader("系统流程")
+    st.subheader("系统流程（v0.3 LLM-driven Context-Aware Tool Agent）")
     steps = st.columns(5)
     flow_steps = [
         ("📤", "上传工单", "Excel/CSV"),
         ("📊", "数据解析", "Polars 引擎"),
         ("🔧", "业务服务", "预测/预警/建议"),
-        ("🧠", "Agent 编排", "LangGraph 6节点"),
+        ("🧠", "Agent 编排", "LangGraph 8节点"),
         ("📋", "诊断报告", "工作台展示"),
     ]
     for i, (icon, title, desc) in enumerate(flow_steps):
@@ -514,6 +518,12 @@ def _handle_agent_query(question: str):
             "last_assetnum": result.get("last_assetnum"),
             "last_task_type": result.get("last_task_type"),
             "status": result.get("status", "unknown"),
+            # v0.3 新增调试字段
+            "query_understanding": result.get("query_understanding", {}),
+            "tool_plan": result.get("tool_plan", {}),
+            "evidence_packet": result.get("evidence_packet", {}),
+            "evidence_evaluation": result.get("evidence_evaluation", {}),
+            "context_packet": result.get("context_packet", {}),
         },
     })
 
@@ -546,7 +556,14 @@ def _render_assistant_meta(meta: dict):
             st.warning(f"⚠️ {err}")
 
     # ── 折叠调试详情 ──
-    with st.expander("🔍 调试详情", expanded=False):
+    with st.expander("🔍 调试详情（v0.3 八节点）", expanded=False):
+        # v0.3 核心节点信息
+        st.markdown("**架构流程**")
+        st.caption(
+            "prepare_context → understand_query → plan_tools → execute_tools "
+            "→ merge_evidence → evaluate_evidence → generate_answer → update_memory"
+        )
+
         st.markdown("**诊断元信息**")
         st.text(
             f"设备编号：{meta.get('assetnum') or '无'}\n"
@@ -556,6 +573,30 @@ def _render_assistant_meta(meta: dict):
             f"Last Assetnum：{meta.get('last_assetnum') or '无'}\n"
             f"Last TaskType：{meta.get('last_task_type') or '无'}"
         )
+
+        # v0.3 新增：问题理解
+        qu = meta.get("query_understanding", {})
+        if qu:
+            st.markdown("**Query Understanding（问题理解）**")
+            st.json(qu)
+
+        # v0.3 新增：工具规划
+        tp = meta.get("tool_plan", {})
+        if tp:
+            st.markdown("**Tool Plan（工具规划）**")
+            st.json(tp)
+
+        # v0.3 新增：证据包
+        ep = meta.get("evidence_packet", {})
+        if ep:
+            st.markdown("**Evidence Packet（证据包）**")
+            st.json(ep)
+
+        # v0.3 新增：证据评估
+        ee = meta.get("evidence_evaluation", {})
+        if ee:
+            st.markdown("**Evidence Evaluation（证据评估）**")
+            st.json(ee)
 
         if selected:
             st.markdown("**工具调用轨迹**")

@@ -1,0 +1,539 @@
+"""向后兼容模块 —— 保留旧三节点 API。
+
+这些函数包装了新八节点流程，使旧测试和代码仍可运行。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from backend.agent.report_builder import (
+    build_advice_report,
+    build_capability_report,
+    build_data_overview_report,
+    build_device_error_report,
+    build_full_diagnosis_report,
+    build_high_risk_report,
+    build_history_report,
+    build_risk_advice_report,
+    build_risk_explanation_report,
+    build_risk_report,
+)
+from backend.agent.state import AfcAgentState, NO_DEVICE_TASKS
+from backend.agent.tools import ALL_TOOLS, TOOL_BY_NAME
+from backend.core.llm import get_parse_llm, get_report_llm
+
+TASK_TYPES = {
+    "capability_query", "data_overview", "high_risk_ranking",
+    "full_diagnosis", "risk_query", "history_query",
+    "advice_query", "risk_explanation", "risk_and_advice_query",
+}
+
+TASK_TOOL_MAP: dict[str, list[str]] = {
+    "capability_query": [],
+    "data_overview": ["get_data_summary_tool"],
+    "high_risk_ranking": ["get_high_risk_devices_tool"],
+    "full_diagnosis": ["get_integrated_analysis_tool"],
+    "risk_query": ["predict_device_risk_tool"],
+    "history_query": ["get_device_history_tool"],
+    "advice_query": ["get_maintenance_advice_tool"],
+    "risk_explanation": ["predict_device_risk_tool"],
+    "risk_and_advice_query": ["predict_device_risk_tool", "get_maintenance_advice_tool"],
+}
+
+MAX_TOOL_CALLS = 5
+
+_REFERENCE_PATTERNS = [
+    r"^那它", r"^它", r"那它", r"它",
+    r"这个设备", r"该设备", r"这设备",
+    r"刚才那个", r"刚才那台", r"刚才的",
+    r"这台", r"那台", r"那一台",
+    r"那应该", r"那这个",
+]
+
+_SWITCH_PATTERNS = [
+    r"换成?\s*([A-Za-z0-9]{3,})",
+    r"再看下?\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+    r"切换(?:到|成)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+    r"(?:换|改)(?:成|为|到)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+]
+
+_GLOBAL_QUESTION_KEYWORDS = [
+    "整体情况", "概览", "这批工单", "数据怎么样", "工单数据",
+    "高风险设备", "优先巡检", "巡检重点", "当前高风险",
+    "有哪些高风险", "今天优先",
+]
+
+_CAPABILITY_KEYWORDS = [
+    "你会干什么", "你是谁", "怎么用", "有什么功能",
+    "你能做什么", "你能干什么", "功能介绍", "使用说明",
+    "你能干嘛", "你会什么", "能做什么", "帮助", "help",
+    "你好", "嗨", "hello", "hi",
+]
+
+
+def _has_reference_pronoun(query: str) -> bool:
+    return any(re.search(pattern, query, flags=re.IGNORECASE) for pattern in _REFERENCE_PATTERNS)
+
+
+def _has_device_switch(query: str) -> str | None:
+    matches: list[str] = []
+    for pattern in _SWITCH_PATTERNS:
+        matches.extend(re.findall(pattern, query, flags=re.IGNORECASE))
+    return matches[-1].upper() if matches else None
+
+
+def _is_capability_question(query: str) -> bool:
+    q = query.lower()
+    return any(kw.lower() in q for kw in _CAPABILITY_KEYWORDS)
+
+
+def _is_global_question(query: str) -> bool:
+    return any(kw in query for kw in _GLOBAL_QUESTION_KEYWORDS)
+
+
+def _extract_assetnum_from_query(query: str) -> str | None:
+    patterns = [
+        r"设备\s*([A-Za-z0-9]{3,})",
+        r"([A-Z]{2,}\d{5,})",
+        r"(\d{10,})",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        found.extend(re.findall(pattern, query))
+    return found[-1].upper() if found else None
+
+
+def _extract_time_window(query: str) -> str | None:
+    mapping = [
+        (["7天", "七天", "一周", "1周"], "7d"),
+        (["14天", "两周", "二周"], "14d"),
+        (["21天", "三周"], "21d"),
+        (["30天", "一个月", "一月", "未来一个月"], "30d"),
+        (["60天", "两个月", "二个月"], "60d"),
+        (["90天", "三个月"], "90d"),
+    ]
+    for keywords, value in mapping:
+        if any(keyword in query for keyword in keywords):
+            return value
+    return None
+
+
+def _rule_based_parse_task_type(query: str) -> str:
+    if _is_capability_question(query):
+        return "capability_query"
+    if any(w in query for w in ["整体", "概览", "这批", "数据怎么样", "工单数据"]):
+        return "data_overview"
+    if any(w in query for w in ["高风险", "优先巡检", "巡检重点", "优先"]):
+        return "high_risk_ranking"
+    has_risk = any(w in query for w in ["风险", "预测"])
+    has_advice = any(w in query for w in ["检查", "建议", "处理", "维修", "先看"])
+    if has_risk and has_advice:
+        return "risk_and_advice_query"
+    if any(w in query for w in ["为什么", "预警", "红色", "橙色", "黄色"]):
+        return "risk_explanation"
+    if has_risk:
+        return "risk_query"
+    if has_advice:
+        return "advice_query"
+    if any(w in query for w in ["历史", "故障", "记录", "以前", "最近有哪些"]):
+        return "history_query"
+    return "full_diagnosis"
+
+
+def _resolve_multiturn_context(
+    query: str,
+    last_assetnum: str | None,
+    last_task_type: str | None,
+    last_time_window: str | None,
+) -> tuple[str | None, str | None, str | None, str]:
+    switch_device = _has_device_switch(query)
+    if switch_device:
+        task_type = _rule_based_parse_task_type(query)
+        if task_type == "full_diagnosis" and last_task_type not in NO_DEVICE_TASKS:
+            task_type = last_task_type or "full_diagnosis"
+        hint = f"用户从上一轮设备 {last_assetnum} 切换到新设备 {switch_device}"
+        return switch_device, task_type, _extract_time_window(query) or last_time_window, hint
+
+    if _is_global_question(query) or _is_capability_question(query):
+        return None, None, None, ""
+
+    explicit_asset = _extract_assetnum_from_query(query)
+    if explicit_asset:
+        return explicit_asset, None, _extract_time_window(query), ""
+
+    if _has_reference_pronoun(query) and last_assetnum:
+        task_type = _rule_based_parse_task_type(query)
+        time_window = _extract_time_window(query) or last_time_window
+        hint = f"用户使用指代词，自动继承上一轮设备 {last_assetnum}"
+        return last_assetnum, task_type, time_window, hint
+
+    return None, None, _extract_time_window(query), ""
+
+
+def _normalize_intent(raw: dict[str, Any], query: str) -> dict[str, Any]:
+    task_type = raw.get("intent") or raw.get("task_type") or "full_diagnosis"
+    if task_type not in TASK_TYPES:
+        task_type = _rule_based_parse_task_type(query)
+    assetnum = raw.get("assetnum")
+    if assetnum:
+        assetnum = str(assetnum).strip().upper()
+        if assetnum in {"NULL", "NONE", "无"}:
+            assetnum = None
+    time_window = raw.get("time_window") or _extract_time_window(query)
+    requires_asset = task_type not in NO_DEVICE_TASKS
+    is_global = task_type in {"data_overview", "high_risk_ranking"}
+    return {
+        "intent": task_type,
+        "assetnum": assetnum,
+        "time_window": time_window,
+        "requires_asset": requires_asset,
+        "is_global": is_global,
+        "confidence": float(raw.get("confidence", 0.7) or 0.7),
+    }
+
+
+def _rule_parse_intent(query: str) -> dict[str, Any]:
+    task_type = _rule_based_parse_task_type(query)
+    return _normalize_intent({
+        "intent": task_type,
+        "assetnum": _extract_assetnum_from_query(query),
+        "time_window": _extract_time_window(query),
+        "confidence": 0.65,
+    }, query)
+
+
+def _format_recent_messages(messages: list[Any], limit: int = 6) -> str:
+    formatted: list[str] = []
+    for message in messages[-limit:]:
+        role = message.__class__.__name__.replace("Message", "")
+        content = getattr(message, "content", str(message))
+        text = str(content).replace("\n", " ").strip()
+        if len(text) > 300:
+            text = text[:300] + "..."
+        formatted.append(f"{role}: {text}")
+    return "\n".join(formatted) if formatted else "无"
+
+
+def _invoke_tool(tool_name: str, assetnum: str | None, tool_args: dict[str, Any] | None = None) -> dict[str, Any]:
+    tool = TOOL_BY_NAME[tool_name]
+    args = dict(tool_args or {})
+    if tool_name == "get_data_summary_tool":
+        args.setdefault("top_n", 10)
+    elif tool_name == "get_high_risk_devices_tool":
+        args.setdefault("top_n", 10)
+    elif tool_name == "list_devices_tool":
+        args = {}
+    elif tool_name == "get_device_history_tool":
+        args.setdefault("assetnum", assetnum)
+        args.setdefault("limit", 50)
+    elif tool_name == "get_integrated_analysis_tool":
+        args.setdefault("assetnum", assetnum)
+        args.setdefault("history_limit", 50)
+    elif tool_name in {"predict_device_risk_tool", "get_maintenance_advice_tool"}:
+        args.setdefault("assetnum", assetnum)
+    return tool.invoke(args)
+
+
+def _device_exists(assetnum: str) -> tuple[bool, dict[str, Any]]:
+    result = _invoke_tool("list_devices_tool", None)
+    devices = result.get("devices", []) if isinstance(result, dict) else []
+    device_ids = {str(item.get("assetnum", "")).strip().upper() for item in devices}
+    return assetnum.strip().upper() in device_ids, result
+
+
+def _merge_evidence(
+    assetnum: str | None,
+    selected_tools: list[str],
+    tool_results: dict[str, Any],
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "assetnum": assetnum,
+        "device_info": {},
+        "history_summary": {},
+        "risk_prediction": {},
+        "warning_result": {},
+        "maintenance_advice": {},
+        "data_overview": {},
+        "high_risk_devices": {},
+        "sources": selected_tools,
+    }
+    integrated = tool_results.get("get_integrated_analysis_tool", {})
+    if isinstance(integrated, dict) and integrated.get("status") == "success":
+        evidence["device_info"] = integrated.get("device_profile", {})
+        evidence["history_summary"] = integrated.get("history_summary", {})
+        evidence["risk_prediction"] = integrated.get("risk_prediction", {})
+        evidence["warning_result"] = {
+            "warning_level": integrated.get("risk_prediction", {}).get("warning_level"),
+            "suggested_inspection_window": integrated.get("risk_prediction", {}).get("suggested_inspection_window"),
+            "warning_reason": integrated.get("risk_prediction", {}).get("warning_reason"),
+        }
+        evidence["maintenance_advice"] = integrated.get("maintenance_advice", {})
+    risk = tool_results.get("predict_device_risk_tool", {})
+    if isinstance(risk, dict) and risk.get("status") == "success":
+        evidence["risk_prediction"] = risk
+        evidence["device_info"] = {
+            "assetnum": risk.get("assetnum"), "station_name": risk.get("station_name"),
+            "line": risk.get("line"), "brand": risk.get("brand"), "subsystem": risk.get("subsystem"),
+        }
+        evidence["warning_result"] = {
+            "warning_level": risk.get("warning_level"),
+            "suggested_inspection_window": risk.get("suggested_inspection_window"),
+            "warning_reason": risk.get("warning_reason"),
+        }
+    advice = tool_results.get("get_maintenance_advice_tool", {})
+    if isinstance(advice, dict) and advice.get("status") == "success":
+        evidence["maintenance_advice"] = advice
+        if not evidence["device_info"]:
+            evidence["device_info"] = {
+                "assetnum": advice.get("assetnum"), "station_name": advice.get("station_name"),
+                "line": advice.get("line"), "brand": advice.get("brand"), "subsystem": advice.get("subsystem"),
+            }
+    if "get_data_summary_tool" in tool_results:
+        evidence["data_overview"] = tool_results["get_data_summary_tool"]
+    if "get_high_risk_devices_tool" in tool_results:
+        evidence["high_risk_devices"] = tool_results["get_high_risk_devices_tool"]
+    return evidence
+
+
+def _build_tool_results_summary(tool_results: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for tool_name, result in tool_results.items():
+        if not isinstance(result, dict) or result.get("status") != "success":
+            continue
+        item: dict[str, Any] = {}
+        for key in [
+            "assetnum", "station_name", "warning_level", "risk_30d", "risk_90d",
+            "suggested_inspection_window",
+        ]:
+            if key in result:
+                item[key] = result[key]
+        if "device_profile" in result:
+            profile = result["device_profile"]
+            item["assetnum"] = profile.get("assetnum")
+            item["station_name"] = profile.get("station_name")
+        if item:
+            summary[tool_name] = item
+    return summary
+
+
+def _select_tools_by_rule(state: AfcAgentState) -> list[tuple[str, dict[str, Any]]]:
+    task_type = state.get("task_type", "full_diagnosis")
+    return [(name, {}) for name in TASK_TOOL_MAP.get(task_type, ["get_integrated_analysis_tool"])]
+
+
+def _template_report_by_task(state: AfcAgentState) -> str:
+    task_type = state.get("task_type", "full_diagnosis")
+    tool_results = state.get("tool_results", {})
+    evidence = state.get("evidence", {})
+    assetnum = state.get("assetnum")
+    query = state.get("query", "")
+    errors = state.get("errors", [])
+
+    if task_type == "capability_query":
+        return build_capability_report()
+    if task_type == "data_overview":
+        return build_data_overview_report(tool_results)
+    if task_type == "high_risk_ranking":
+        return build_high_risk_report(tool_results)
+    if state.get("asset_exists") is False or (state.get("requires_asset") and not assetnum):
+        return build_device_error_report(assetnum, query, errors)
+    if task_type == "risk_query":
+        return build_risk_report(evidence, query)
+    if task_type == "history_query":
+        return build_history_report(evidence, query)
+    if task_type == "advice_query":
+        return build_advice_report(evidence, query)
+    if task_type == "risk_explanation":
+        return build_risk_explanation_report(evidence, query)
+    if task_type == "risk_and_advice_query":
+        return build_risk_advice_report(evidence, query)
+    return build_full_diagnosis_report(evidence, query)
+
+
+# ── 旧节点函数（保持行为不变）─────────────────────────────────────
+
+def parse_intent_node(state: AfcAgentState) -> dict[str, Any]:
+    """旧版问题解析节点（兼容）。"""
+    query = state["query"].strip()
+    errors: list[str] = []
+    last_assetnum = state.get("last_assetnum")
+    last_task_type = state.get("last_task_type")
+    last_time_window = state.get("last_time_window")
+    recent_messages = _format_recent_messages(state.get("messages", []))
+
+    resolved_asset, resolved_task, resolved_time, hint = _resolve_multiturn_context(
+        query, last_assetnum, last_task_type, last_time_window
+    )
+
+    if _is_capability_question(query) or _is_global_question(query):
+        parsed = _rule_parse_intent(query)
+    else:
+        parsed = _rule_parse_intent(query)
+
+    if resolved_asset:
+        parsed["assetnum"] = resolved_asset
+        errors.append(f"多轮上下文补全：自动关联设备 {resolved_asset}")
+    if resolved_task:
+        parsed["intent"] = resolved_task
+        parsed["requires_asset"] = resolved_task not in NO_DEVICE_TASKS
+        parsed["is_global"] = resolved_task in {"data_overview", "high_risk_ranking"}
+    if resolved_time and not parsed.get("time_window"):
+        parsed["time_window"] = resolved_time
+
+    parsed = _normalize_intent(parsed, query)
+
+    return {
+        "intent": parsed,
+        "assetnum": parsed["assetnum"],
+        "task_type": parsed["intent"],
+        "time_window": parsed["time_window"],
+        "requires_asset": parsed["requires_asset"],
+        "is_global": parsed["is_global"],
+        "errors": errors,
+    }
+
+
+def reason_act_node(state: AfcAgentState) -> dict[str, Any]:
+    """旧版推理执行节点（兼容）。"""
+    assetnum = state.get("assetnum")
+    task_type = state.get("task_type", "full_diagnosis")
+    requires_asset = state.get("requires_asset", task_type not in NO_DEVICE_TASKS)
+    errors: list[str] = list(state.get("errors", []))
+    selected_tools: list[str] = []
+    tool_results: dict[str, Any] = {}
+    tool_trace: list[dict[str, Any]] = []
+
+    if task_type == "capability_query":
+        return {
+            "asset_exists": True, "selected_tools": [], "tool_results": {},
+            "tool_trace": [], "evidence": {"sources": [], "assetnum": None}, "errors": errors,
+        }
+
+    if requires_asset and not assetnum:
+        errors.append("未从问题中识别到设备编号，请提供设备编号")
+        return {
+            "asset_exists": False, "selected_tools": [], "tool_results": {},
+            "tool_trace": [], "evidence": {"sources": [], "assetnum": None}, "errors": errors,
+        }
+
+    if requires_asset and assetnum:
+        try:
+            exists, list_result = _device_exists(assetnum)
+            tool_trace.append({"tool": "list_devices_tool", "status": list_result.get("status", "unknown"), "purpose": "asset_validation"})
+            if not exists:
+                errors.append(f"设备编号 {assetnum} 在当前工单数据中不存在")
+                return {
+                    "asset_exists": False, "selected_tools": [], "tool_results": {},
+                    "tool_trace": tool_trace, "evidence": {"sources": [], "assetnum": assetnum}, "errors": errors,
+                }
+        except Exception as exc:
+            errors.append(f"设备校验异常（已宽松处理）：{str(exc)}")
+
+    selected = _select_tools_by_rule(state)
+    for tool_name, args in selected[:MAX_TOOL_CALLS]:
+        if tool_name not in TOOL_BY_NAME:
+            errors.append(f"工具 {tool_name} 未注册或不在白名单中")
+            continue
+        if tool_name in selected_tools:
+            continue
+        try:
+            result = _invoke_tool(tool_name, assetnum, args)
+            selected_tools.append(tool_name)
+            tool_results[tool_name] = result
+            tool_trace.append({
+                "tool": tool_name, "args": args,
+                "status": result.get("status", "success") if isinstance(result, dict) else "success",
+            })
+        except Exception as exc:
+            selected_tools.append(tool_name)
+            message = str(exc)
+            tool_results[tool_name] = {"status": "error", "message": message}
+            tool_trace.append({"tool": tool_name, "args": args, "status": "error", "message": message})
+            errors.append(f"工具 {tool_name} 调用失败：{message}")
+
+    evidence = _merge_evidence(assetnum, selected_tools, tool_results)
+    return {
+        "asset_exists": True, "selected_tools": selected_tools,
+        "tool_results": tool_results, "tool_trace": tool_trace,
+        "evidence": evidence, "errors": errors,
+    }
+
+
+def generate_report_node(state: AfcAgentState) -> dict[str, Any]:
+    """旧版报告生成节点（兼容）。"""
+    task_type = state.get("task_type", "full_diagnosis")
+    if task_type == "capability_query" or state.get("asset_exists") is False:
+        final_answer = _template_report_by_task(state)
+    else:
+        final_answer = _template_report_by_task(state)
+    tool_results = state.get("tool_results", {})
+    messages = list(state.get("messages", []))
+    messages.append(HumanMessage(content=state.get("query", "")))
+    messages.append(AIMessage(content=final_answer))
+    last_assetnum = state.get("assetnum") if task_type not in NO_DEVICE_TASKS else state.get("last_assetnum")
+    return {
+        "final_answer": final_answer,
+        "last_assetnum": last_assetnum,
+        "last_task_type": task_type,
+        "last_time_window": state.get("time_window"),
+        "last_tool_results_summary": _build_tool_results_summary(tool_results),
+        "messages": messages[-20:],
+    }
+
+
+# ── 旧节点名兼容包装 ──────────────────────────────────────────────
+
+def parse_question_node(state: AfcAgentState) -> dict[str, Any]:
+    return parse_intent_node(state)
+
+
+def resolve_asset_node(state: AfcAgentState) -> dict[str, Any]:
+    task_type = state.get("task_type", "full_diagnosis")
+    compat_state = {
+        **state,
+        "requires_asset": task_type not in NO_DEVICE_TASKS,
+        "selected_tools": [], "tool_results": {}, "evidence": {}, "tool_trace": [],
+    }
+    result = reason_act_node(compat_state)
+    return {"asset_exists": result.get("asset_exists"), "errors": result.get("errors", [])}
+
+
+def route_task_node(state: AfcAgentState) -> dict[str, Any]:
+    return {"selected_tools": [name for name, _ in _select_tools_by_rule(state)]}
+
+
+def execute_tools_node(state: AfcAgentState) -> dict[str, Any]:
+    selected = state.get("selected_tools", [])
+    # 兼容 v0.3：从 tool_plan 中提取工具名
+    if not selected:
+        tool_plan = state.get("tool_plan", {})
+        for tc in tool_plan.get("tool_calls", []):
+            name = tc.get("tool_name")
+            if name and name not in selected:
+                selected.append(name)
+    if not selected:
+        return {"tool_results": {}, "errors": list(state.get("errors", []))}
+    tool_results: dict[str, Any] = {}
+    errors = list(state.get("errors", []))
+    for tool_name in selected:
+        try:
+            tool_results[tool_name] = _invoke_tool(tool_name, state.get("assetnum"), {})
+        except Exception as exc:
+            errors.append(f"工具 {tool_name} 调用失败：{str(exc)}")
+            tool_results[tool_name] = {"status": "error", "message": str(exc)}
+    return {"tool_results": tool_results, "errors": errors}
+
+
+def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
+    return {
+        "evidence": _merge_evidence(
+            state.get("assetnum"),
+            state.get("selected_tools", []),
+            state.get("tool_results", {}),
+        )
+    }

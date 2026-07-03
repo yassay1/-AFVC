@@ -1,6 +1,6 @@
-"""Agent 智能诊断 API —— LangGraph 版。
+"""Agent 智能诊断 API —— LangGraph v0.3 版。
 
-POST /agent/diagnose → 调用 AFCDiagnosisAgent 工作流。
+POST /agent/diagnose → 调用 v0.3 八节点 Agent 工作流。
 支持多轮对话：传入 session_id 可让 Agent 记住上下文。
 """
 
@@ -45,6 +45,12 @@ class DiagnoseResponse(BaseModel):
     session_id: str | None = None
     last_assetnum: str | None = None
     last_task_type: str | None = None
+    # v0.3 新增字段
+    context_packet: dict = Field(default_factory=dict, description="上下文包")
+    query_understanding: dict = Field(default_factory=dict, description="问题理解结果")
+    tool_plan: dict = Field(default_factory=dict, description="工具规划")
+    evidence_packet: dict = Field(default_factory=dict, description="统一证据包")
+    evidence_evaluation: dict = Field(default_factory=dict, description="证据评估结果")
 
 
 router = APIRouter(
@@ -55,33 +61,34 @@ router = APIRouter(
 
 @router.post("/diagnose", response_model=DiagnoseResponse)
 def diagnose(request: DiagnoseRequest):
-    """AFC 智能诊断 Agent 入口（LangGraph 版，支持多轮对话）。
+    """AFC 智能诊断 Agent 入口（LangGraph v0.3 八节点版，支持多轮对话）。
 
-    工作流：
-    1. parse_question  → LLM 解析用户问题（多轮模式下继承上下文）
-    2. resolve_asset   → 校验设备编号
-    3. route_task      → 匹配任务类型 → 选择工具
-    4. execute_tools   → 调用 LangChain Tools
-    5. merge_evidence  → 整合工具结果为证据
-    6. generate_report → LLM / 模板生成诊断报告
+    工作流（v0.3）：
+    1. prepare_context   → 整理上下文，输出 ContextPacket
+    2. understand_query  → LLM 理解用户问题，输出 QueryUnderstanding
+    3. plan_tools        → LLM 规划工具调用，输出 ToolPlan
+    4. execute_tools     → 执行工具计划
+    5. merge_evidence    → 合并工具结果为 EvidencePacket
+    6. evaluate_evidence → LLM 评估证据是否足够（不足则回到 plan_tools）
+    7. generate_answer   → LLM 基于证据生成最终回答
+    8. update_memory     → 更新多轮对话状态
+
+    LLM 四个角色：
+    - Query Understanding：结构化理解用户问题
+    - Tool Planning：规划工具调用
+    - Evidence Evaluation：评估证据充分性
+    - Answer Generation：基于证据生成回答
 
     多轮对话：
     - 传入 session_id 可让 Agent 记住上一轮的设备编号和分析结果
     - 支持指代补全：用户说"那它风险高吗？"可自动关联上一轮设备
     - 支持设备切换：用户说"换成 EX011115 呢？"可自动切换设备
-
-    支持的问题类型：
-    - 数据概览："这批工单整体情况怎么样？"
-    - 高风险设备："今天优先巡检哪些设备？"
-    - 单设备分析："帮我分析设备 1000029970"
-    - 风险查询："设备 1000029970 未来 30 天风险高吗？"
-    - 历史查询："设备 1000029970 最近有哪些故障？"
-    - 维修建议："设备 1000029970 建议检查什么？"
-    - 预警解释："为什么设备 1000029970 是红色预警？"
+    - 支持 RAG 维修手册检索：用户说"按维修手册应该查哪里？"
 
     科学边界：
     - 风险预测表示再次产生故障工单的风险，不等同于物理故障预测
     - 维修建议是巡检方向参考，不是根因诊断结论
+    - 不能预测具体故障日期
     """
     try:
         result = run_diagnosis(request.query, session_id=request.session_id)

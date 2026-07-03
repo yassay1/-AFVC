@@ -17,6 +17,7 @@ from backend.agent.tools import (
     get_maintenance_advice_tool,
     get_integrated_analysis_tool,
     get_high_risk_devices_tool,
+    search_maintenance_manual_tool,
     ALL_TOOLS,
     TOOL_BY_NAME,
 )
@@ -32,8 +33,8 @@ UNKNOWN_ASSETNUM = "ZZZ99999"
 class TestToolRegistry:
 
     def test_all_tools_registered(self):
-        """应有 8 个工具。"""
-        assert len(ALL_TOOLS) == 8
+        """应有 9 个工具（8 个业务工具 + 1 个 RAG 手册检索工具）。"""
+        assert len(ALL_TOOLS) == 9
 
     def test_tool_by_name_matches(self):
         """TOOL_BY_NAME 应与 ALL_TOOLS 一致。"""
@@ -171,3 +172,15 @@ class TestHighRiskDevicesTool:
         assert 0 < len(devices) <= 5
         if len(devices) >= 2:
             assert devices[0]["risk_90d"] >= devices[1]["risk_90d"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# RAG 维修手册工具
+# ═══════════════════════════════════════════════════════════════
+
+class TestMaintenanceManualTool:
+
+    def test_invoke_search_manual(self):
+        result = search_maintenance_manual_tool.invoke({"query": "票卡不接收", "top_k": 3})
+        assert result["status"] in {"success", "empty"}
+        assert "results" in result

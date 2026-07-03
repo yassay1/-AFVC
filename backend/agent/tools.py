@@ -13,6 +13,7 @@ from backend.services.prediction_service import get_high_risk_devices as _get_hi
 from backend.services.warning_service import generate_warning_info as _generate_warning_info
 from backend.services.advice_service import generate_device_advice as _generate_device_advice
 from backend.services.analysis_service import generate_device_analysis as _generate_device_analysis
+from backend.services.rag_service import search_manual as _search_manual
 
 
 @tool
@@ -228,6 +229,44 @@ def get_high_risk_devices_tool(top_n: int = 10) -> dict:
         return {"status": "error", "message": f"高风险设备查询失败：{str(e)}"}
 
 
+@tool
+def search_maintenance_manual_tool(
+    query: str,
+    assetnum: str | None = None,
+    subsystem: str | None = None,
+    fault_phenomenon: str | None = None,
+    top_k: int = 5,
+) -> dict:
+    """检索 AFC 设备维修手册和规程文件。
+
+    根据用户问题在知识库中搜索相关维修检查步骤、可能原因、
+    备件建议等内容。
+
+    适用场景：
+    - 用户明确要求按维修手册/规程/标准流程回答
+    - advice_query 需要维修手册依据增强时
+    - full_diagnosis 需要维修建议时
+    - 用户问"按手册应该先查哪里"
+
+    Args:
+        query: 检索查询文本（通常是用户问题或故障现象）。
+        assetnum: 设备编号（可选，用于增加相关检索词）。
+        subsystem: 子系统名称（可选，如票卡/扇门/通信/主控）。
+        fault_phenomenon: 故障现象描述（可选）。
+        top_k: 返回结果数，默认 5。
+    """
+    try:
+        return _search_manual(
+            query=query,
+            assetnum=assetnum,
+            subsystem=subsystem,
+            fault_phenomenon=fault_phenomenon,
+            top_k=top_k,
+        )
+    except Exception as e:
+        return {"status": "error", "message": f"维修手册检索失败：{str(e)}"}
+
+
 # ── 工具注册表 ──────────────────────────────────────────────
 
 ALL_TOOLS = [
@@ -239,6 +278,7 @@ ALL_TOOLS = [
     get_maintenance_advice_tool,
     get_integrated_analysis_tool,
     get_high_risk_devices_tool,
+    search_maintenance_manual_tool,
 ]
 
 TOOL_BY_NAME = {tool.name: tool for tool in ALL_TOOLS}
