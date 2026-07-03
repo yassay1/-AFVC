@@ -3,7 +3,7 @@
 面向地铁 AFC（自动售检票）设备的智能运维系统。基于真实故障工单数据，通过 **LLM-driven Context-Aware Tool Agent（LangGraph 八节点 + LangChain Tools + RAG）** 编排，预测设备复发风险、生成红橙黄绿预警，并提供可解释的诊断报告。
 
 > **项目定位**：面试演示型 MVP，重点在 Agent 工程编排与工具调用闭环，而非预测模型训练。
-> **v0.3 更新**：Agent 从三节点升级为八节点 LLM-driven 架构，LLM 承担四个角色（Query Understanding / Tool Planning / Evidence Evaluation / Answer Generation），新增维修手册 RAG 检索工具。
+> **v0.3.0 更新**：Agent 从三节点升级为八节点 LLM-driven 架构，LLM 承担四个角色（Query Understanding / Tool Planning / Evidence Evaluation / Answer Generation），新增维修手册 RAG 检索工具。旧三节点兼容代码（compat 模块）已标记为 LEGACY。
 
 [![Python](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/fastapi-0.139-green)](https://fastapi.tiangolo.com/)
@@ -11,10 +11,10 @@
 
 ---
 
-## Agent 架构升级（v0.2 → v0.3/v0.4）
+## Agent 架构升级（v0.2 → v0.3.0）
 
 ```
-v0.2 三节点：                    v0.3/v0.4 八节点：
+v0.2 三节点：                    v0.3.0 八节点：
 parse_intent                     prepare_context     → 整理上下文
    ↓                             understand_query    → LLM 理解问题
 reason_act                       plan_tools          → LLM 规划工具
@@ -68,7 +68,7 @@ afc_fault_agent_system/
 │   │       ├── evaluate_evidence.py
 │   │       ├── generate_answer.py
 │   │       ├── update_memory.py
-│   │       └── compat.py           # 向后兼容旧三节点 API
+│   │       └── compat.py           # ⚠️ LEGACY: 旧三节点兼容 API
 │   ├── services/                   # 业务服务层（8 服务）
 │   │   ├── rag_service.py          # 新：维修手册 RAG 检索
 │   │   └── ...
@@ -82,11 +82,11 @@ afc_fault_agent_system/
 ├── tests/
 │   ├── test_services.py
 │   ├── test_agent_tools.py
-│   ├── test_agent_graph.py         # 兼容旧三节点测试
-│   ├── test_agent_v03_nodes.py     # 新：八节点单元测试
-│   ├── test_agent_v03_graph.py     # 新：八节点端到端测试
-│   ├── test_llm_json.py            # 新：LLM JSON 工具测试
-│   └── test_rag_service.py         # 新：RAG 服务测试
+│   ├── test_agent_graph.py         # ⚠️ LEGACY: 兼容旧三节点（部分测试标记 legacy）
+│   ├── test_agent_v03_nodes.py     # v0.3: 八节点单元测试
+│   ├── test_agent_v03_graph.py     # v0.3: 八节点端到端测试（fake LLM）
+│   ├── test_llm_json.py            # v0.3: LLM JSON 工具测试
+│   └── test_rag_service.py         # v0.3: RAG 服务测试
 ├── docs/
 │   ├── architecture.md
 │   └── project-brief.md
@@ -159,6 +159,26 @@ Agent：[调用 RAG 检索维修手册，返回检查步骤]
 Agent：[切换到 EX011115，返回新设备分析]
 ```
 
+### 5. 运行测试
+
+```bash
+# 运行核心测试（不含 legacy / LLM / slow）
+python -m pytest tests/ -m "not legacy and not llm and not slow" -q
+
+# 按模块运行
+python -m pytest tests/test_services.py -q        # 服务层 (24 tests)
+python -m pytest tests/test_agent_tools.py -q     # 工具层 (18 tests)
+python -m pytest tests/test_llm_json.py -q        # JSON 工具 (13 tests)
+python -m pytest tests/test_rag_service.py -q     # RAG 服务 (11 tests)
+python -m pytest tests/test_agent_v03_nodes.py -q # 八节点单元 (23 tests)
+python -m pytest tests/test_agent_v03_graph.py -q # 八节点端到端 (15 tests)
+
+# 运行 legacy 测试（旧三节点兼容，非当前主验收标准）
+python -m pytest tests/test_agent_graph.py -m legacy -q
+```
+
+> 注意：不配置 LLM API Key 也能运行大部分测试——Agent 会自动使用规则兜底。
+
 ---
 
 ## API 文档
@@ -178,22 +198,42 @@ Agent：[切换到 EX011115，返回新设备分析]
 
 ---
 
-## Agent 支持的问题类型（12 种）
+## v0.3.0 路由与回答模式
 
-| 类型 | 示例 | 调用工具 |
-|------|------|----------|
-| `capability_query` | "你会干什么？" | — |
-| `data_overview` | "这批工单整体情况怎么样？" | data_summary |
-| `high_risk_ranking` | "当前高风险设备有哪些？" | high_risk_devices |
-| `full_diagnosis` | "帮我分析设备 1000029970" | integrated_analysis |
-| `risk_query` | "设备 1000029970 未来30天风险高吗？" | predict_device_risk |
-| `advice_query` | "设备 1000029970 建议检查什么？" | maintenance_advice |
-| `history_query` | "设备 1000029970 最近有哪些故障？" | device_history |
-| `risk_explanation` | "为什么是橙色预警？" | predict_device_risk |
-| `risk_and_advice_query` | "风险高不高？应该检查什么？" | predict + advice |
-| `manual_query` | "按维修手册应该查哪里？" | **search_maintenance_manual** |
-| `followup_rewrite` | "换成 EX011115 呢？" | 继承上下文 |
-| `unknown` | — | 兜底 full_diagnosis |
+### route（粗粒度语义路由）
+
+| route | 适用场景 | 示例 | 调用工具 |
+|-------|---------|------|---------|
+| `direct_chat` | 闲聊/问候 | "你好""谢谢" | — |
+| `capability_query` | 询问系统能力 | "你能做什么？" | — |
+| `business_global` | 全局数据问题 | "数据概览""高风险排行" | data_summary / high_risk_devices |
+| `business_device` | 单设备业务问题 | "分析设备1000029970" | 视 business_goal 而定 |
+| `needs_clarification` | 缺少关键参数 | "帮我分析一下"（无设备号） | — |
+| `unsupported` | 超出系统能力 | "帮我写论文" | — |
+
+### answer_mode（回答模式）
+
+| answer_mode | 说明 | 是否调工具 |
+|-------------|------|-----------|
+| `direct_chat` | 自然问候 + 简短能力介绍 | 否 |
+| `capability_intro` | 系统功能说明 + 示例问题 | 否 |
+| `ask_for_assetnum` | 请用户提供设备编号 | 否 |
+| `evidence_based` | 基于 EvidencePacket 生成回答 | 是 |
+| `unsupported` | 礼貌说明能力边界 | 否 |
+
+### business_goal（细粒度业务目标）
+
+| business_goal | 调用工具 |
+|---------------|---------|
+| `data_overview` | get_data_summary_tool |
+| `high_risk_ranking` | get_high_risk_devices_tool |
+| `device_risk` | predict_device_risk_tool |
+| `device_history` | get_device_history_tool |
+| `device_advice` | get_maintenance_advice_tool |
+| `full_diagnosis` | get_integrated_analysis_tool |
+| `manual_search` | search_maintenance_manual_tool |
+
+> **核心改进（v0.3.0）**：通过 route + answer_mode 设计，确保"你好"不会调用业务工具，"帮我分析一下"（无设备号）会明确追问而不是报底层 validation error。
 
 ---
 
@@ -225,11 +265,11 @@ Agent：[切换到 EX011115，返回新设备分析]
 
 ## 后续升级方向
 
-| 模块 | 当前（v0.3） | 计划 |
+| 模块 | 当前（v0.3.0） | 计划 |
 |------|-------------|------|
-| 预测模型 | Mock + 外部 CSV | 接入真实 ML 模型 |
+| 预测模型 | Mock + 外部 CSV adapter | 接入真实 ML 模型 |
 | Agent | 八节点 LLM-driven Tool Agent | tool-calling Agent + multi-agent |
-| RAG | 关键词匹配 .txt/.md | 向量数据库 + embedding（ChromaDB/FAISS） |
+| RAG | 关键词匹配 .txt/.md（已实现） | 向量数据库 + embedding（ChromaDB/FAISS） |
 | 数据存储 | 文件系统 | PostgreSQL / MySQL |
 | 前端 | Streamlit | 可升级 React/Vue |
 | 部署 | 本地 | Docker + 云部署 |

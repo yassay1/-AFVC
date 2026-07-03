@@ -72,7 +72,7 @@ CAPABILITY_BOUNDARY: dict[str, Any] = {
     "can_predict_risk_window": True,
     "can_confirm_root_cause": False,
     "can_provide_inspection_suggestions": True,
-    "can_retrieve_maintenance_manual": False,  # RAG 实现后变为 True
+    "can_retrieve_maintenance_manual": True,  # RAG 已实现：关键词检索维修手册
     "risk_prediction_is_probabilistic": True,
     "maintenance_advice_is_directional": True,
     "data_dependent_on_uploaded_workorders": True,
@@ -82,6 +82,29 @@ CAPABILITY_BOUNDARY: dict[str, Any] = {
 # ── 否认全局问题设备 ──────────────────────────────────────────
 
 NO_DEVICE_TASKS = {"capability_query", "data_overview", "high_risk_ranking"}
+
+# v0.3.0: 不需要设备的 route 类型
+NO_DEVICE_ROUTES = {
+    "direct_chat",
+    "capability_query",
+    "business_global",
+    "unsupported",
+}
+
+# v0.3.0: 不需要工具调用的 route 类型
+NO_TOOL_ROUTES = {
+    "direct_chat",
+    "capability_query",
+    "needs_clarification",
+    "unsupported",
+}
+
+# v0.3.0: 不污染业务上下文的 route 类型
+CHAT_ROUTES = {
+    "direct_chat",
+    "capability_query",
+    "unsupported",
+}
 
 
 def create_initial_state(query: str) -> AfcAgentState:

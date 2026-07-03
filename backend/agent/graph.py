@@ -117,6 +117,7 @@ def _compat_evidence_from_packet(evidence_packet: dict) -> dict:
         "data_overview": evidence_packet.get("data_overview") or {},
         "high_risk_devices": evidence_packet.get("high_risk_devices") or {},
         "sources": evidence_packet.get("sources", []),
+        "tool_errors": evidence_packet.get("tool_errors", []),
     }
 
 
@@ -137,9 +138,10 @@ def _compat_selected_tools(final_state: dict) -> list[str]:
 
 
 def _compat_asset_exists(query_understanding: dict, evidence_packet: dict, tool_trace: list[dict]) -> bool | None:
-    """根据 v0.3 状态估算旧 API asset_exists。"""
-    task_type = query_understanding.get("task_type")
-    if task_type in {"capability_query", "data_overview", "high_risk_ranking"}:
+    """根据 v0.3.0 状态估算旧 API asset_exists。"""
+    route = query_understanding.get("route", "")
+    # 非设备路由 → 不需要 assetnum
+    if route in {"direct_chat", "capability_query", "business_global", "unsupported"}:
         return True
     if query_understanding.get("needs_asset") and not query_understanding.get("assetnum"):
         return False
@@ -184,10 +186,12 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
     query_understanding = final_state.get("query_understanding", {})
     evidence_packet = final_state.get("evidence_packet", {})
     tool_trace = final_state.get("tool_trace", [])
+    tool_plan = final_state.get("tool_plan", {})
     selected_tools = _compat_selected_tools(final_state)
     asset_exists = _compat_asset_exists(query_understanding, evidence_packet, tool_trace)
     task_type = query_understanding.get("task_type")
     assetnum = query_understanding.get("assetnum") or evidence_packet.get("assetnum")
+    route = query_understanding.get("route", "")
 
     return {
         "status": "success",
@@ -198,7 +202,7 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
         "task_type": task_type,
         "time_window": query_understanding.get("time_window"),
         "requires_asset": query_understanding.get("needs_asset"),
-        "is_global": task_type in {"capability_query", "data_overview", "high_risk_ranking"},
+        "is_global": route in {"capability_query", "business_global", "direct_chat", "unsupported"},
         "asset_exists": asset_exists,
         "selected_tools": selected_tools,
         "tool_results": final_state.get("tool_results", {}),
@@ -209,10 +213,14 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
         "session_id": session_id,
         "last_assetnum": final_state.get("last_assetnum"),
         "last_task_type": final_state.get("last_task_type"),
-        # v0.3 新字段
+        # v0.3.0 新字段
         "context_packet": final_state.get("context_packet", {}),
         "query_understanding": final_state.get("query_understanding", {}),
-        "tool_plan": final_state.get("tool_plan", {}),
+        "tool_plan": tool_plan,
         "evidence_packet": evidence_packet,
         "evidence_evaluation": final_state.get("evidence_evaluation", {}),
+        # v0.3.0 路由字段
+        "route": route,
+        "business_goal": query_understanding.get("business_goal"),
+        "answer_mode": tool_plan.get("answer_mode", ""),
     }

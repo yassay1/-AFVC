@@ -1,6 +1,11 @@
-"""向后兼容模块 —— 保留旧三节点 API。
+"""向后兼容模块 —— 保留旧三节点 API（⚠️ LEGACY）。
 
-这些函数包装了新八节点流程，使旧测试和代码仍可运行。
+这些函数用于兼容 v0.2 三节点测试和旧代码。
+v0.3 主流程使用八节点架构（nodes/ 下各文件），不依赖本模块。
+
+注意：本模块中的文本匹配辅助函数（如 _has_reference_pronoun 等）
+已迁移至 understand_query.py。兼容层通过 re-export 引用同一实现，
+避免代码重复。
 """
 
 from __future__ import annotations
@@ -27,6 +32,17 @@ from backend.agent.state import AfcAgentState, NO_DEVICE_TASKS
 from backend.agent.tools import ALL_TOOLS, TOOL_BY_NAME
 from backend.core.llm import get_parse_llm, get_report_llm
 
+# ── 从 understand_query.py 导入核心辅助函数（v0.3 版本）──
+# 兼容层不再重复定义这些函数，直接引用 understand_query_node 的实现。
+from backend.agent.nodes.understand_query import (
+    _has_reference_pronoun,
+    _has_device_switch,
+    _is_capability_question,
+    _is_global_question,
+    _extract_assetnum as _extract_assetnum_from_query,
+    _extract_time_window,
+)
+
 TASK_TYPES = {
     "capability_query", "data_overview", "high_risk_ranking",
     "full_diagnosis", "risk_query", "history_query",
@@ -47,20 +63,7 @@ TASK_TOOL_MAP: dict[str, list[str]] = {
 
 MAX_TOOL_CALLS = 5
 
-_REFERENCE_PATTERNS = [
-    r"^那它", r"^它", r"那它", r"它",
-    r"这个设备", r"该设备", r"这设备",
-    r"刚才那个", r"刚才那台", r"刚才的",
-    r"这台", r"那台", r"那一台",
-    r"那应该", r"那这个",
-]
-
-_SWITCH_PATTERNS = [
-    r"换成?\s*([A-Za-z0-9]{3,})",
-    r"再看下?\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
-    r"切换(?:到|成)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
-    r"(?:换|改)(?:成|为|到)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
-]
+# ── 旧版常量（仅用于 compat 内部逻辑）─────────────────────────────
 
 _GLOBAL_QUESTION_KEYWORDS = [
     "整体情况", "概览", "这批工单", "数据怎么样", "工单数据",
@@ -74,53 +77,6 @@ _CAPABILITY_KEYWORDS = [
     "你能干嘛", "你会什么", "能做什么", "帮助", "help",
     "你好", "嗨", "hello", "hi",
 ]
-
-
-def _has_reference_pronoun(query: str) -> bool:
-    return any(re.search(pattern, query, flags=re.IGNORECASE) for pattern in _REFERENCE_PATTERNS)
-
-
-def _has_device_switch(query: str) -> str | None:
-    matches: list[str] = []
-    for pattern in _SWITCH_PATTERNS:
-        matches.extend(re.findall(pattern, query, flags=re.IGNORECASE))
-    return matches[-1].upper() if matches else None
-
-
-def _is_capability_question(query: str) -> bool:
-    q = query.lower()
-    return any(kw.lower() in q for kw in _CAPABILITY_KEYWORDS)
-
-
-def _is_global_question(query: str) -> bool:
-    return any(kw in query for kw in _GLOBAL_QUESTION_KEYWORDS)
-
-
-def _extract_assetnum_from_query(query: str) -> str | None:
-    patterns = [
-        r"设备\s*([A-Za-z0-9]{3,})",
-        r"([A-Z]{2,}\d{5,})",
-        r"(\d{10,})",
-    ]
-    found: list[str] = []
-    for pattern in patterns:
-        found.extend(re.findall(pattern, query))
-    return found[-1].upper() if found else None
-
-
-def _extract_time_window(query: str) -> str | None:
-    mapping = [
-        (["7天", "七天", "一周", "1周"], "7d"),
-        (["14天", "两周", "二周"], "14d"),
-        (["21天", "三周"], "21d"),
-        (["30天", "一个月", "一月", "未来一个月"], "30d"),
-        (["60天", "两个月", "二个月"], "60d"),
-        (["90天", "三个月"], "90d"),
-    ]
-    for keywords, value in mapping:
-        if any(keyword in query for keyword in keywords):
-            return value
-    return None
 
 
 def _rule_based_parse_task_type(query: str) -> str:

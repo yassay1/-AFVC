@@ -1,4 +1,4 @@
-# AFC RiskOps Agent System — 项目说明书（v0.3/v0.4）
+# AFC RiskOps Agent System — 项目说明书（v0.3.0）
 
 > 项目定位、目标用户、核心价值与面试讲解口径。
 
@@ -10,9 +10,9 @@
 
 ---
 
-## 2. 架构升级（v0.2 → v0.3/v0.4）
+## 2. 架构升级（v0.2 → v0.3.0）
 
-| 维度 | v0.2（旧） | v0.3/v0.4（新） |
+| 维度 | v0.2（旧） | v0.3.0（新） |
 |------|-----------|----------------|
 | Agent 节点 | 三节点（parse_intent / reason_act / generate_report） | 八节点（prepare_context → understand_query → plan_tools → execute_tools → merge_evidence → evaluate_evidence → generate_answer → update_memory） |
 | LLM 角色 | 1 个（报告生成） | 4 个（Query Understanding / Tool Planning / Evidence Evaluation / Answer Generation） |
@@ -29,15 +29,22 @@
 
 LLM 在结构化约束下完成四个角色，所有风险数值、设备信息、历史工单和维修建议都来自工具结果。维修手册通过 RAG 工具按需检索，最终回答受 EvidencePacket 约束。
 
-### 3.2 工具规划由 LLM 解释
+### 3.2 粗粒度路由 + answer_mode（v0.3.0 新增）
+
+不是简单的 task_type 分类游戏，而是通过三层设计决定行为：
+- **route**（6 种）决定"怎么处理"：闲聊/能力/全局/单设备/缺参数/不支持
+- **business_goal**（7 种）决定"具体做什么"：概览/排行/风险/历史/建议/诊断/手册
+- **answer_mode**（5 种）决定"如何回答"：直接聊天/能力介绍/追问编号/证据回答/能力边界
+
+### 3.3 工具规划由 LLM 解释
 
 不是简单的 task_type → tool 映射，而是让 LLM 解释：为什么调用这个工具？希望拿到什么证据？已有证据够不够？需不需要 RAG？
 
-### 3.3 证据评估循环
+### 3.4 证据评估循环
 
-evaluate_evidence_node 判断证据是否足够。不足时回到 plan_tools 补充工具（最多 2 轮），形成反馈闭环。
+evaluate_evidence_node 尊重 answer_mode：非 evidence_based 模式直接可回答。evidence_based 模式才检查证据充分性。不足时回到 plan_tools 补充工具（最多 2 轮），形成反馈闭环。工具错误（missing_required_argument）不再触发补充循环。
 
-### 3.4 RAG 是按需工具
+### 3.5 RAG 是按需工具
 
 维修手册 RAG 不是默认上下文，而是由 plan_tools / evaluate_evidence 决定是否调用。这避免了不相关手册内容干扰 LLM 推理。
 
@@ -98,11 +105,11 @@ evaluate_evidence_node 判断证据是否足够。不足时回到 plan_tools 补
 
 ## 8. 后续升级方向
 
-| 模块 | 当前（v0.3） | 计划 |
+| 模块 | 当前（v0.3.0） | 计划 |
 |------|-------------|------|
-| 预测模型 | Mock + 外部 CSV | 接入真实 ML 模型 |
+| 预测模型 | Mock + 外部 CSV adapter | 接入真实 ML 模型 |
 | Agent | 八节点 LLM-driven Agent | tool-calling Agent + multi-agent |
-| RAG | 关键词匹配（.txt/.md） | 向量数据库 + embedding（ChromaDB/FAISS） |
+| RAG | 关键词匹配 .txt/.md（已实现） | 向量数据库 + embedding（ChromaDB/FAISS） |
 | 数据存储 | 文件系统 | PostgreSQL/MySQL |
 | 前端 | Streamlit | 可升级 React/Vue |
 | 部署 | 本地 | Docker + 云部署 |
@@ -110,7 +117,7 @@ evaluate_evidence_node 判断证据是否足够。不足时回到 plan_tools 补
 
 ---
 
-## 9. 验收标准（v0.3）
+## 9. 验收标准（v0.3.0）
 
 ### 后端
 - 八节点 Agent 图正确编译和运行

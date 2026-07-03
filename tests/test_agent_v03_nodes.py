@@ -74,8 +74,9 @@ class TestUnderstandQuery:
         }
         result = understand_query_node(state)
         understanding = result["query_understanding"]
+        # v0.3.0: route 为主路由，assetnum 应来自指代继承
         assert understanding["assetnum"] == KNOWN_ASSETNUM
-        assert understanding["task_type"] in ("history_query", "full_diagnosis")
+        assert understanding["route"] in ("business_device", "followup_rewrite")
 
     def test_understand_capability_query(self):
         state = create_initial_state("你会干什么？")
@@ -88,8 +89,10 @@ class TestUnderstandQuery:
         }
         result = understand_query_node(state)
         understanding = result["query_understanding"]
-        assert understanding["task_type"] in ("capability_query", "unknown")
+        # v0.3.0: route 为主路由
+        assert understanding["route"] in ("capability_query", "direct_chat")
         assert understanding["needs_asset"] is False
+        assert understanding["needs_tools"] is False
 
     def test_understand_high_risk_ranking(self):
         state = create_initial_state("当前高风险设备有哪些")
@@ -102,8 +105,10 @@ class TestUnderstandQuery:
         }
         result = understand_query_node(state)
         understanding = result["query_understanding"]
-        assert understanding["task_type"] in ("high_risk_ranking", "data_overview")
+        # v0.3.0: route 为主路由
+        assert understanding["route"] in ("business_global", "data_overview")
         assert understanding["needs_asset"] is False
+        assert understanding["business_goal"] in ("high_risk_ranking", "data_overview", None)
 
 
 class TestPlanTools:
@@ -112,18 +117,24 @@ class TestPlanTools:
     def test_plan_capability_query_no_tools(self):
         state = create_initial_state("你会干什么")
         state["query_understanding"] = {
+            "route": "capability_query",
             "task_type": "capability_query",
             "needs_asset": False,
+            "needs_tools": False,
         }
         result = plan_tools_node(state)
         assert result["tool_plan"]["tool_calls"] == []
+        assert result["tool_plan"]["answer_mode"] == "capability_intro"
 
     def test_plan_risk_query(self):
         state = create_initial_state(f"设备 {KNOWN_ASSETNUM} 未来30天风险高吗")
         state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "device_risk",
             "task_type": "risk_query",
             "assetnum": KNOWN_ASSETNUM,
             "needs_asset": True,
+            "needs_tools": True,
         }
         state["assetnum"] = KNOWN_ASSETNUM
         result = plan_tools_node(state)
@@ -133,9 +144,12 @@ class TestPlanTools:
     def test_plan_advice_query(self):
         state = create_initial_state(f"设备 {KNOWN_ASSETNUM} 应该先检查什么")
         state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "device_advice",
             "task_type": "advice_query",
             "assetnum": KNOWN_ASSETNUM,
             "needs_asset": True,
+            "needs_tools": True,
         }
         state["assetnum"] = KNOWN_ASSETNUM
         result = plan_tools_node(state)
@@ -145,9 +159,12 @@ class TestPlanTools:
     def test_plan_full_diagnosis(self):
         state = create_initial_state(f"帮我分析设备 {KNOWN_ASSETNUM}")
         state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "full_diagnosis",
             "task_type": "full_diagnosis",
             "assetnum": KNOWN_ASSETNUM,
             "needs_asset": True,
+            "needs_tools": True,
         }
         state["assetnum"] = KNOWN_ASSETNUM
         result = plan_tools_node(state)
@@ -177,7 +194,7 @@ class TestExecuteTools:
 
     def test_execute_integrated_analysis(self):
         state = create_initial_state(f"分析设备 {KNOWN_ASSETNUM}")
-        state["query_understanding"] = {"assetnum": KNOWN_ASSETNUM}
+        state["query_understanding"] = {"assetnum": KNOWN_ASSETNUM, "route": "business_device", "business_goal": "full_diagnosis"}
         state["tool_plan"] = {
             "tool_calls": [
                 {
@@ -197,7 +214,7 @@ class TestMergeEvidence:
 
     def test_merge_integrated_analysis(self):
         state = create_initial_state(f"分析设备 {KNOWN_ASSETNUM}")
-        state["query_understanding"] = {"task_type": "full_diagnosis", "assetnum": KNOWN_ASSETNUM}
+        state["query_understanding"] = {"route": "business_device", "business_goal": "full_diagnosis", "task_type": "full_diagnosis", "assetnum": KNOWN_ASSETNUM}
         state["tool_plan"] = {
             "tool_calls": [
                 {"tool_name": "get_integrated_analysis_tool", "args": {"assetnum": KNOWN_ASSETNUM}}
@@ -221,13 +238,15 @@ class TestEvaluateEvidence:
 
     def test_evaluate_capability_answerable(self):
         state = create_initial_state("你会干什么")
-        state["query_understanding"] = {"task_type": "capability_query"}
+        state["query_understanding"] = {"route": "capability_query", "task_type": "capability_query"}
+        state["tool_plan"] = {"answer_mode": "capability_intro"}
         result = evaluate_evidence_node(state)
         assert result["evidence_evaluation"]["answerable"] is True
 
     def test_evaluate_full_diagnosis_without_risk(self):
         state = create_initial_state(f"分析设备 {KNOWN_ASSETNUM}")
-        state["query_understanding"] = {"task_type": "full_diagnosis", "assetnum": KNOWN_ASSETNUM}
+        state["query_understanding"] = {"route": "business_device", "business_goal": "full_diagnosis", "task_type": "full_diagnosis", "assetnum": KNOWN_ASSETNUM}
+        state["tool_plan"] = {"answer_mode": "evidence_based"}
         state["evidence_packet"] = {
             "assetnum": KNOWN_ASSETNUM,
             "risk_prediction": None,
@@ -246,17 +265,26 @@ class TestGenerateAnswer:
 
     def test_capability_report(self):
         state = create_initial_state("你会干什么")
-        state["query_understanding"] = {"task_type": "capability_query", "needs_asset": False}
+        state["query_understanding"] = {
+            "route": "capability_query",
+            "task_type": "capability_query",
+            "needs_asset": False,
+            "needs_tools": False,
+        }
+        state["tool_plan"] = {"answer_mode": "capability_intro"}
         result = generate_answer_node(state)
         assert "功能介绍" in result["final_answer"]
 
     def test_report_with_evidence(self):
         state = create_initial_state(f"帮我分析设备 {KNOWN_ASSETNUM}")
         state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "full_diagnosis",
             "task_type": "full_diagnosis",
             "assetnum": KNOWN_ASSETNUM,
             "needs_asset": True,
         }
+        state["tool_plan"] = {"answer_mode": "evidence_based"}
         state["evidence_packet"] = {
             "assetnum": KNOWN_ASSETNUM,
             "device_profile": {"assetnum": KNOWN_ASSETNUM, "station_name": "测试站"},
@@ -274,6 +302,8 @@ class TestUpdateMemory:
     def test_update_memory_preserves_assetnum(self):
         state = create_initial_state(f"分析设备 {KNOWN_ASSETNUM}")
         state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "full_diagnosis",
             "task_type": "full_diagnosis",
             "assetnum": KNOWN_ASSETNUM,
         }
@@ -285,6 +315,8 @@ class TestUpdateMemory:
     def test_update_memory_global_query_clears_asset(self):
         state = create_initial_state("当前高风险设备有哪些")
         state["query_understanding"] = {
+            "route": "business_global",
+            "business_goal": "high_risk_ranking",
             "task_type": "high_risk_ranking",
             "assetnum": None,
         }
@@ -298,10 +330,176 @@ class TestUpdateMemory:
         state = create_initial_state("你好")
         state["query"] = "你好"
         state["query_understanding"] = {
-            "task_type": "capability_query",
+            "route": "direct_chat",
+            "task_type": "direct_chat",
             "assetnum": None,
         }
         state["final_answer"] = "你好，我是AFC助手"
         state["messages"] = []
         result = update_memory_node(state)
         assert len(result["messages"]) == 2  # user + assistant
+
+
+# ═══════════════════════════════════════════════════════════════
+# v0.3.0 新增测试：route / answer_mode / 闲聊 / 缺参数
+# ═══════════════════════════════════════════════════════════════
+
+class TestV030RouteChat:
+    """v0.3.0: 闲聊路由测试。"""
+
+    def test_chat_hello_detected_as_direct_chat(self):
+        """'你好' 应识别为 direct_chat，不调用工具。"""
+        state = create_initial_state("你好")
+        state["context_packet"] = {
+            "active_assetnum": None,
+            "active_task_type": None,
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+        assert understanding["route"] == "direct_chat"
+        assert understanding["needs_tools"] is False
+
+    def test_chat_hello_plan_no_tools(self):
+        """'你好' plan_tools 应返回空工具 + direct_chat answer_mode。"""
+        state = create_initial_state("你好")
+        state["query_understanding"] = {
+            "route": "direct_chat",
+            "task_type": "direct_chat",
+            "needs_asset": False,
+            "needs_tools": False,
+        }
+        result = plan_tools_node(state)
+        assert result["tool_plan"]["tool_calls"] == []
+        assert result["tool_plan"]["answer_mode"] == "direct_chat"
+
+    def test_chat_hello_generates_greeting(self):
+        """'你好' generate_answer 应返回问候语。"""
+        state = create_initial_state("你好")
+        state["query_understanding"] = {
+            "route": "direct_chat",
+            "task_type": "direct_chat",
+        }
+        state["tool_plan"] = {"answer_mode": "direct_chat"}
+        result = generate_answer_node(state)
+        assert len(result["final_answer"]) > 10
+        assert "AFC" in result["final_answer"] or "助手" in result["final_answer"]
+
+    def test_chat_preserves_business_context(self):
+        """闲聊'谢谢'不应清除上一轮设备编号。"""
+        state = create_initial_state("谢谢")
+        state["last_assetnum"] = KNOWN_ASSETNUM
+        state["last_task_type"] = "full_diagnosis"
+        state["query_understanding"] = {
+            "route": "direct_chat",
+            "task_type": "direct_chat",
+            "assetnum": None,
+        }
+        state["final_answer"] = "不客气！"
+        result = update_memory_node(state)
+        assert result["last_assetnum"] == KNOWN_ASSETNUM  # 保留原设备
+
+
+class TestV030Capability:
+    """v0.3.0: 能力询问测试。"""
+
+    def test_capability_route_detected(self):
+        """'你能做什么' 应识别为 capability_query。"""
+        state = create_initial_state("你能做什么")
+        state["context_packet"] = {
+            "active_assetnum": None,
+            "active_task_type": None,
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+        assert understanding["route"] == "capability_query"
+        assert understanding["needs_tools"] is False
+
+    def test_capability_plan_no_tools(self):
+        """能力询问不应规划工具。"""
+        state = create_initial_state("你能做什么")
+        state["query_understanding"] = {
+            "route": "capability_query",
+            "task_type": "capability_query",
+            "needs_asset": False,
+            "needs_tools": False,
+        }
+        result = plan_tools_node(state)
+        assert result["tool_plan"]["tool_calls"] == []
+        assert result["tool_plan"]["answer_mode"] == "capability_intro"
+
+
+class TestV030MissingAsset:
+    """v0.3.0: 缺少设备编号测试。"""
+
+    def test_missing_asset_route_detected(self):
+        """'帮我分析一下这个设备'（无上下文）应识别为 needs_clarification。"""
+        state = create_initial_state("帮我分析一下这个设备")
+        state["context_packet"] = {
+            "active_assetnum": None,
+            "active_task_type": None,
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+        assert understanding["route"] in ("needs_clarification", "business_device")
+        assert understanding["needs_tools"] is False or understanding["assetnum"] is None
+
+    def test_missing_asset_plan_ask(self):
+        """缺少设备编号时 answer_mode 应为 ask_for_assetnum。"""
+        state = create_initial_state("帮我分析一下")
+        state["query_understanding"] = {
+            "route": "needs_clarification",
+            "business_goal": None,
+            "task_type": "unknown",
+            "needs_asset": False,
+            "needs_tools": False,
+        }
+        result = plan_tools_node(state)
+        assert result["tool_plan"]["tool_calls"] == []
+        assert result["tool_plan"]["answer_mode"] == "ask_for_assetnum"
+
+
+class TestV030AnswerMode:
+    """v0.3.0: answer_mode 分派测试。"""
+
+    def test_unsupported_generates_boundary_msg(self):
+        """超出系统能力的问题应返回边界说明。"""
+        state = create_initial_state("帮我写论文")
+        state["query_understanding"] = {"route": "unsupported"}
+        state["tool_plan"] = {"answer_mode": "unsupported"}
+        result = generate_answer_node(state)
+        assert "超出" in result["final_answer"] or "范围" in result["final_answer"]
+
+    def test_ask_for_assetnum_generates_prompt(self):
+        """缺少设备编号的回答应引导用户提供编号。"""
+        state = create_initial_state("test")
+        state["query_understanding"] = {}
+        state["tool_plan"] = {"answer_mode": "ask_for_assetnum"}
+        result = generate_answer_node(state)
+        assert "设备编号" in result["final_answer"]
+
+    def test_evidence_based_with_tool_error_asks_assetnum(self):
+        """missing_required_argument 错误应转为追问设备编号。"""
+        state = create_initial_state("帮我分析设备")
+        state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "full_diagnosis",
+            "assetnum": None,
+        }
+        state["tool_plan"] = {"answer_mode": "evidence_based"}
+        state["evidence_packet"] = {
+            "sources": [],
+            "tool_errors": [
+                {"tool": "get_integrated_analysis_tool", "error_type": "missing_required_argument", "message": "缺少设备编号"}
+            ],
+        }
+        result = generate_answer_node(state)
+        assert "设备编号" in result["final_answer"]

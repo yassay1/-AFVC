@@ -1,6 +1,10 @@
-"""AFC Agent v0.3 统一结构化 Schema。
+"""AFC Agent v0.3.0 统一结构化 Schema。
 
-所有 LLM 输出、工具计划和证据包的统一数据模型。
+v0.3.0 升级：
+- QueryUnderstanding 增加 route + business_goal（粗粒度语义路由）
+- ToolPlan 增加 answer_mode（回答模式）
+- EvidencePacket 增加 tool_errors（工具错误承载）
+- 保留 task_type 用于向后兼容，但主逻辑优先使用 route/business_goal
 """
 
 from typing import Any, Literal
@@ -48,11 +52,43 @@ class ContextPacket(BaseModel):
     )
 
 
-# ── 问题理解 ──────────────────────────────────────────────────
+# ── 问题理解（v0.3.0 升级）──────────────────────────────────
 
 class QueryUnderstanding(BaseModel):
-    """understand_query_node 的输出 —— LLM 结构化理解。"""
+    """understand_query_node 的输出 —— LLM 结构化理解。
 
+    v0.3.0 升级：新增 route 和 business_goal 作为主路由字段。
+    task_type 保留用于向后兼容，但 plan_tools 等下游节点应优先使用 route。
+    """
+
+    # ── v0.3.0 新增：粗粒度语义路由 ──
+    route: Literal[
+        "direct_chat",           # 闲聊/问候
+        "capability_query",      # 询问系统能力
+        "business_global",       # 全局业务问题（数据概览/高风险排行）
+        "business_device",       # 单设备业务问题
+        "needs_clarification",   # 缺少关键参数（如设备编号）
+        "unsupported",           # 超出系统能力
+    ] = Field(
+        default="direct_chat",
+        description="粗粒度语义路由，决定后续节点行为",
+    )
+
+    business_goal: Literal[
+        "data_overview",         # 数据概览
+        "high_risk_ranking",     # 高风险设备排行
+        "device_risk",           # 单设备风险查询
+        "device_history",        # 单设备历史查询
+        "device_advice",         # 单设备维修建议
+        "full_diagnosis",        # 单设备完整诊断
+        "manual_search",         # 维修手册检索
+        None,
+    ] = Field(
+        default=None,
+        description="细粒度业务目标（business_global / business_device 时有效）",
+    )
+
+    # ── 兼容字段：task_type（保留用于旧 API 和前端）──────────
     task_type: Literal[
         "capability_query",
         "data_overview",
@@ -65,13 +101,19 @@ class QueryUnderstanding(BaseModel):
         "risk_and_advice_query",
         "manual_query",
         "followup_rewrite",
+        "direct_chat",
         "unknown",
-    ] = Field(description="任务类型")
+    ] = Field(
+        default="unknown",
+        description="旧 task_type 字段，由 route + business_goal 自动映射生成",
+    )
 
+    # ── 参数提取 ──
     assetnum: str | None = Field(default=None, description="识别到的设备编号")
     time_window: str | None = Field(default=None, description="识别到的时间窗口")
 
     needs_asset: bool = Field(description="该任务是否需要设备编号")
+    needs_tools: bool = Field(description="是否需要调用业务工具")
     needs_rag: bool = Field(description="是否需要维修手册 RAG 检索")
     context_used: bool = Field(description="是否使用了上下文中的信息（指代消解等）")
 
@@ -83,7 +125,7 @@ class QueryUnderstanding(BaseModel):
     )
 
 
-# ── 工具计划 ──────────────────────────────────────────────────
+# ── 工具计划（v0.3.0 升级）──────────────────────────────────
 
 class ToolCallPlanItem(BaseModel):
     """单个工具调用计划项。"""
@@ -97,7 +139,10 @@ class ToolCallPlanItem(BaseModel):
 
 
 class ToolPlan(BaseModel):
-    """plan_tools_node 的输出 —— LLM 工具规划结果。"""
+    """plan_tools_node 的输出 —— LLM 工具规划结果。
+
+    v0.3.0 升级：新增 answer_mode，决定最终回答的生成方式。
+    """
 
     tool_calls: list[ToolCallPlanItem] = Field(
         default_factory=list, description="计划调用的工具列表"
@@ -106,6 +151,19 @@ class ToolPlan(BaseModel):
         default=False, description="是否使用已有证据（不需再调工具）"
     )
     reason: str = Field(description="规划原因说明")
+
+    # ── v0.3.0 新增：回答模式 ──
+    answer_mode: Literal[
+        "direct_chat",           # 普通闲聊
+        "capability_intro",      # 系统能力介绍
+        "ask_for_assetnum",      # 缺少设备编号，追问用户
+        "evidence_based",        # 基于证据包回答
+        "unsupported",           # 超出系统能力
+    ] = Field(
+        default="direct_chat",
+        description="回答模式，决定 generate_answer 的行为",
+    )
+
     answer_policy: dict[str, Any] = Field(
         default_factory=dict, description="回答策略约束（如不能预测具体日期等）"
     )
@@ -121,13 +179,20 @@ class ToolExecutionResult(BaseModel):
     status: str = Field(description="执行状态：success / error")
     result: dict[str, Any] | None = Field(default=None, description="工具返回结果")
     error: str | None = Field(default=None, description="错误信息")
+    error_type: str | None = Field(
+        default=None,
+        description="错误类型（如 missing_required_argument / tool_execution_error）",
+    )
     duration_ms: float | None = Field(default=None, description="执行耗时（毫秒）")
 
 
-# ── 证据包 ────────────────────────────────────────────────────
+# ── 证据包（v0.3.0 升级）────────────────────────────────────
 
 class EvidencePacket(BaseModel):
-    """merge_evidence_node 输出的统一证据包。"""
+    """merge_evidence_node 输出的统一证据包。
+
+    v0.3.0 升级：新增 tool_errors，承载工具执行失败信息。
+    """
 
     assetnum: str | None = Field(default=None, description="目标设备编号")
 
@@ -155,17 +220,26 @@ class EvidencePacket(BaseModel):
     )
 
     sources: list[str] = Field(
-        default_factory=list, description="证据来源工具列表"
+        default_factory=list, description="证据来源工具列表（仅成功）"
     )
     missing_evidence: list[str] = Field(
         default_factory=list, description="缺失的证据类型"
+    )
+
+    # ── v0.3.0 新增：工具错误 ──
+    tool_errors: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="工具执行过程中产生的错误，每个元素包含 tool/error_type/message",
     )
 
 
 # ── 证据评估 ──────────────────────────────────────────────────
 
 class EvidenceEvaluation(BaseModel):
-    """evaluate_evidence_node 的输出 —— LLM 证据充分性评估。"""
+    """evaluate_evidence_node 的输出 —— LLM 证据充分性评估。
+
+    v0.3.0 更新：非 evidence_based 模式不要求业务证据。
+    """
 
     answerable: bool = Field(description="当前证据是否足够回答用户问题")
     need_more_tools: bool = Field(description="是否需要补充工具调用")
@@ -227,3 +301,40 @@ class MemoryUpdate(BaseModel):
     should_clear_active_asset: bool = Field(
         default=False, description="是否清除活跃设备（全局问题等场景）"
     )
+
+
+# ── route → task_type 映射（兼容旧代码）─────────────────────
+
+def route_to_task_type(route: str, business_goal: str | None) -> str:
+    """将 v0.3.0 route + business_goal 映射为旧版 task_type。
+
+    这允许 plan_tools 等下游节点继续使用旧 task_type 做工具路由，
+    同时也让旧 API 返回兼容的 task_type。
+    """
+    if route == "direct_chat":
+        return "direct_chat"
+    if route == "capability_query":
+        return "capability_query"
+    if route == "unsupported":
+        return "unknown"
+    if route == "needs_clarification":
+        return "unknown"
+    if route == "business_global":
+        if business_goal == "data_overview":
+            return "data_overview"
+        if business_goal == "high_risk_ranking":
+            return "high_risk_ranking"
+        return "data_overview"
+    if route == "business_device":
+        if business_goal == "device_risk":
+            return "risk_query"
+        if business_goal == "device_history":
+            return "history_query"
+        if business_goal == "device_advice":
+            return "advice_query"
+        if business_goal == "full_diagnosis":
+            return "full_diagnosis"
+        if business_goal == "manual_search":
+            return "manual_query"
+        return "full_diagnosis"
+    return "unknown"

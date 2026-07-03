@@ -72,11 +72,47 @@ class _FakeGraphLLM:
             assetnum = active_assetnum
 
         needs_asset = task_type not in {"capability_query", "data_overview", "high_risk_ranking", "unknown"}
+        needs_tools = task_type not in {"capability_query", "unknown", "direct_chat"}
+
+        # v0.3.0: route 映射
+        route_map = {
+            "capability_query": "capability_query",
+            "data_overview": "business_global",
+            "high_risk_ranking": "business_global",
+            "full_diagnosis": "business_device",
+            "risk_query": "business_device",
+            "history_query": "business_device",
+            "advice_query": "business_device",
+            "risk_explanation": "business_device",
+            "risk_and_advice_query": "business_device",
+            "followup_rewrite": "business_device",
+            "unknown": "business_device" if assetnum else "needs_clarification",
+        }
+        goal_map = {
+            "capability_query": None,
+            "data_overview": "data_overview",
+            "high_risk_ranking": "high_risk_ranking",
+            "full_diagnosis": "full_diagnosis",
+            "risk_query": "device_risk",
+            "history_query": "device_history",
+            "advice_query": "device_advice",
+            "risk_explanation": "device_risk",
+            "risk_and_advice_query": "full_diagnosis",
+            "followup_rewrite": "full_diagnosis",
+            "unknown": "full_diagnosis",
+        }
+
+        route = route_map.get(task_type, "business_device" if assetnum else "direct_chat")
+        business_goal = goal_map.get(task_type)
+
         return json.dumps({
+            "route": route,
+            "business_goal": business_goal,
             "task_type": task_type,
             "assetnum": assetnum,
             "time_window": "30d" if "30" in query else None,
             "needs_asset": needs_asset,
+            "needs_tools": needs_tools,
             "needs_rag": False,
             "context_used": bool(assetnum and assetnum == active_assetnum and active_assetnum),
             "information_need": f"fake {task_type}",
@@ -123,10 +159,18 @@ class _FakeGraphLLM:
         else:
             calls = [call("get_integrated_analysis_tool", {"assetnum": assetnum})]
 
+        # answer_mode 映射
+        answer_mode_map = {
+            "capability_query": "capability_intro",
+            "data_overview": "evidence_based",
+            "high_risk_ranking": "evidence_based",
+        }
+
         return json.dumps({
             "tool_calls": calls,
             "use_existing_evidence": False,
             "reason": f"fake plan for {task_type}",
+            "answer_mode": answer_mode_map.get(task_type, "evidence_based") if calls else "direct_chat",
             "answer_policy": {
                 "must_not_predict_exact_failure_date": True,
                 "must_answer_with_risk_window": True,

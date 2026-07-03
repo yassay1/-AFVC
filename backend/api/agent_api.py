@@ -45,12 +45,16 @@ class DiagnoseResponse(BaseModel):
     session_id: str | None = None
     last_assetnum: str | None = None
     last_task_type: str | None = None
-    # v0.3 新增字段
+    # v0.3.0 新增字段
     context_packet: dict = Field(default_factory=dict, description="上下文包")
     query_understanding: dict = Field(default_factory=dict, description="问题理解结果")
-    tool_plan: dict = Field(default_factory=dict, description="工具规划")
-    evidence_packet: dict = Field(default_factory=dict, description="统一证据包")
+    tool_plan: dict = Field(default_factory=dict, description="工具规划（含 answer_mode）")
+    evidence_packet: dict = Field(default_factory=dict, description="统一证据包（含 tool_errors）")
     evidence_evaluation: dict = Field(default_factory=dict, description="证据评估结果")
+    # v0.3.0 路由字段
+    route: str | None = Field(default=None, description="粗粒度语义路由")
+    business_goal: str | None = Field(default=None, description="细粒度业务目标")
+    answer_mode: str | None = Field(default=None, description="回答模式")
 
 
 router = APIRouter(

@@ -5,7 +5,7 @@
 
 ---
 
-## 1. 总体架构（v0.3/v0.4）
+## 1. 总体架构（v0.3.0）
 
 ```
 Streamlit 前端 (6 页面)
@@ -34,7 +34,7 @@ Service 业务服务层 (8 服务，含 RAG)
 
 ---
 
-## 2. Agent 工作流（v0.3 八节点）
+## 2. Agent 工作流（v0.3.0 八节点）
 
 ```
 START
@@ -72,36 +72,40 @@ END
 ### 关键设计原则
 
 - **LLM 不直接编造答案**：所有风险数值、设备信息、历史工单和维修建议都来自工具结果
-- **证据包约束回答**：generate_answer_node 只能基于 EvidencePacket 回答
+- **证据包约束回答**：generate_answer_node 在 evidence_based 模式下只能基于 EvidencePacket 回答
 - **RAG 是按需工具**：不是默认上下文，由 plan_tools / evaluate_evidence 决定是否调用
 - **结构化输出工程**：LLM JSON 输出经过 extract → json.loads → Pydantic → repair 四步处理
+- **成熟路由设计（v0.3.0）**：通过 route + business_goal + answer_mode 三层设计，确保闲聊不调用工具、缺参数追问、超出能力说明边界，不通过不断新增节点解决边界问题
+- **answer_mode 驱动回答**：direct_chat / capability_intro / ask_for_assetnum / evidence_based / unsupported 五种模式，由 plan_tools 决定，generate_answer 执行
 
 ---
 
-## 3. Agent State（v0.3 升级版）
+## 3. Agent State（v0.3.0 升级版）
 
 ```python
 class AfcAgentState(TypedDict, total=False):
-    # v0.3 新增
-    context_packet: dict[str, Any]
-    query_understanding: dict[str, Any]
-    tool_plan: dict[str, Any]
-    evidence_packet: dict[str, Any]
-    evidence_evaluation: dict[str, Any]
-    tool_loop_count: int
-    memory_update: dict[str, Any]
-    last_evidence_summary: dict[str, Any]
+    # v0.3.0 八节点字段
+    context_packet: dict[str, Any]          # prepare_context 输出
+    query_understanding: dict[str, Any]     # understand_query 输出
+    tool_plan: dict[str, Any]               # plan_tools 输出
+    tool_results: dict[str, Any]            # execute_tools 输出
+    tool_trace: list[dict[str, Any]]        # 工具调用追踪
+    evidence_packet: dict[str, Any]         # merge_evidence 输出
+    evidence_evaluation: dict[str, Any]     # evaluate_evidence 输出
+    answer_policy: dict[str, Any]           # 回答约束策略
+    memory_update: dict[str, Any]           # update_memory 输出
+    tool_loop_count: int                    # 工具循环计数
+    last_evidence_summary: dict[str, Any]   # 跨轮证据摘要
 
-    # 兼容字段
+    # 跨轮记忆（checkpointer 持久化）
     query: str
-    intent: dict[str, Any]
-    assetnum: Optional[str]
-    task_type: Optional[str]
     final_answer: str
     errors: list[str]
     messages: list[BaseMessage]
     last_assetnum: Optional[str]
-    ...
+    last_task_type: Optional[str]
+    last_time_window: Optional[str]
+    last_tool_results_summary: dict[str, Any]
 ```
 
 ---
@@ -153,11 +157,12 @@ RAG 不是默认上下文，而是维修手册检索工具。由 plan_tools_node
 - full_diagnosis 中需要维修建议增强时
 - 用户明确说"按手册""按规程""按维修手册""按标准流程"
 
-### 第一版实现
+### 第一版实现（已实现）
 
 - 读取 `backend/data/knowledge/manuals` 下的 .txt / .md 文件
 - 按段落切分，关键词 n-gram 匹配 + 相似度评分
 - 返回 top_k 结果
+- 由 `search_maintenance_manual_tool` 工具封装，Agent 按需调用
 - 后续可升级为向量数据库 + embedding 方案
 
 ---
@@ -216,7 +221,7 @@ backend/
       evaluate_evidence.py
       generate_answer.py
       update_memory.py
-      compat.py            # 向后兼容旧三节点 API
+      compat.py            # ⚠️ LEGACY: 旧三节点兼容 API（非主流程）
   services/
     data_service.py, device_service.py, prediction_service.py,
     warning_service.py, advice_service.py, analysis_service.py,

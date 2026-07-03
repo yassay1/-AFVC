@@ -1,8 +1,13 @@
-"""merge_evidence_node —— 证据合并节点。
+"""merge_evidence_node —— 证据合并节点（v0.3.0 升级）。
 
 职责：
 把原始 tool_results 整理成统一的 EvidencePacket。
 后续 generate_answer_node 只看 EvidencePacket，不直接看 tool_results。
+
+v0.3.0 升级：
+- 新增 tool_errors 字段，承载工具执行失败信息
+- 区分成功结果和失败结果
+- 空证据包对于 direct_chat/capability_intro/ask_for_assetnum 是正常的
 """
 
 from __future__ import annotations
@@ -13,15 +18,38 @@ from backend.agent.state import AfcAgentState
 
 
 def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
-    """合并工具结果为统一证据包。
+    """合并工具结果为统一证据包（v0.3.0 升级版）。
 
     输入：tool_results, tool_trace, query_understanding
-    输出：evidence_packet
+    输出：evidence_packet（含 tool_errors）
     """
     tool_results = state.get("tool_results", {})
     tool_trace = state.get("tool_trace", [])
     query_understanding = state.get("query_understanding", {})
     assetnum = query_understanding.get("assetnum")
+
+    # ── 收集工具错误 ──
+    tool_errors: list[dict[str, Any]] = []
+    for trace_item in tool_trace:
+        if trace_item.get("status") == "error":
+            tool_errors.append({
+                "tool": trace_item.get("tool", ""),
+                "error_type": trace_item.get("error_type", "tool_execution_error"),
+                "message": trace_item.get("message", "未知工具错误"),
+                "args": trace_item.get("args", {}),
+            })
+
+    # 也从 tool_results 中收集错误（有些错误可能在调用前就产生了）
+    for tool_name, result in tool_results.items():
+        if isinstance(result, dict) and result.get("status") == "error":
+            already_recorded = any(e.get("tool") == tool_name for e in tool_errors)
+            if not already_recorded:
+                tool_errors.append({
+                    "tool": tool_name,
+                    "error_type": result.get("error_type", "tool_execution_error"),
+                    "message": result.get("message", str(result)),
+                    "args": {},
+                })
 
     evidence_packet: dict[str, Any] = {
         "assetnum": assetnum,
@@ -35,6 +63,7 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
         "high_risk_devices": None,
         "sources": [t.get("tool") for t in tool_trace if t.get("status") == "success"],
         "missing_evidence": [],
+        "tool_errors": tool_errors,
     }
 
     # ── 从 get_integrated_analysis_tool 提取 ──
@@ -113,25 +142,35 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
         evidence_packet["high_risk_devices"] = high_risk.get("devices", [])
 
     # ── 根据 query_understanding 初步判断缺失证据 ──
-    task_type = query_understanding.get("task_type", "")
-    missing: list[str] = []
+    answer_mode = state.get("tool_plan", {}).get("answer_mode", "")
+    # 只有 evidence_based 才需要检查缺失证据
+    if answer_mode == "evidence_based":
+        route = query_understanding.get("route", "")
+        business_goal = query_understanding.get("business_goal")
+        missing: list[str] = []
 
-    if task_type in ("risk_query", "risk_explanation", "risk_and_advice_query", "full_diagnosis"):
-        if not evidence_packet["risk_prediction"]:
-            missing.append("risk_prediction")
+        if business_goal in ("device_risk", "full_diagnosis") or route == "business_device":
+            if not evidence_packet["risk_prediction"] and business_goal in ("device_risk", "full_diagnosis"):
+                missing.append("risk_prediction")
 
-    if task_type in ("advice_query", "risk_and_advice_query", "full_diagnosis"):
-        if not evidence_packet["maintenance_advice"]:
-            missing.append("maintenance_advice")
+        if business_goal in ("device_advice", "full_diagnosis"):
+            if not evidence_packet["maintenance_advice"]:
+                missing.append("maintenance_advice")
 
-    if task_type in ("history_query", "full_diagnosis"):
-        if not evidence_packet["history_summary"]:
-            missing.append("history_summary")
+        if business_goal in ("device_history", "full_diagnosis"):
+            if not evidence_packet["history_summary"]:
+                missing.append("history_summary")
 
-    if task_type == "manual_query" or (query_understanding.get("needs_rag")):
-        if not evidence_packet["manual_evidence"]:
-            missing.append("manual_evidence")
+        if business_goal == "manual_search":
+            if not evidence_packet["manual_evidence"]:
+                missing.append("manual_evidence")
 
-    evidence_packet["missing_evidence"] = missing
+        if business_goal == "data_overview" and not evidence_packet["data_overview"]:
+            missing.append("data_overview")
+
+        if business_goal == "high_risk_ranking" and not evidence_packet["high_risk_devices"]:
+            missing.append("high_risk_devices")
+
+        evidence_packet["missing_evidence"] = missing
 
     return {"evidence_packet": evidence_packet}

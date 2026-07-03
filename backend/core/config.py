@@ -15,4 +15,4 @@ LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "afc-riskops-agent")
 
 PROJECT_NAME: str = "AFC 故障复发风险预测与智能维修建议系统"
-PROJECT_VERSION: str = "0.2.1"
+PROJECT_VERSION: str = "0.3.0"
