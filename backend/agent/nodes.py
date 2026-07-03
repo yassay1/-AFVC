@@ -247,6 +247,18 @@ def _rule_parse_intent(query: str) -> dict[str, Any]:
     )
 
 
+def _format_recent_messages(messages: list[Any], limit: int = 6) -> str:
+    formatted: list[str] = []
+    for message in messages[-limit:]:
+        role = message.__class__.__name__.replace("Message", "")
+        content = getattr(message, "content", str(message))
+        text = str(content).replace("\n", " ").strip()
+        if len(text) > 300:
+            text = text[:300] + "..."
+        formatted.append(f"{role}: {text}")
+    return "\n".join(formatted) if formatted else "无"
+
+
 def parse_intent_node(state: AfcAgentState) -> dict[str, Any]:
     """理解用户问题并输出经过校验的结构化意图。"""
     query = state["query"].strip()
@@ -254,23 +266,37 @@ def parse_intent_node(state: AfcAgentState) -> dict[str, Any]:
     last_assetnum = state.get("last_assetnum")
     last_task_type = state.get("last_task_type")
     last_time_window = state.get("last_time_window")
+    recent_messages = _format_recent_messages(state.get("messages", []))
 
     resolved_asset, resolved_task, resolved_time, hint = _resolve_multiturn_context(
         query, last_assetnum, last_task_type, last_time_window
     )
 
     # 明显问题规则优先，避免能力/全局问题误入设备诊断。
-    if _is_capability_question(query) or _is_global_question(query) or resolved_asset:
+    if _is_capability_question(query) or _is_global_question(query):
         parsed = _rule_parse_intent(query)
     else:
         try:
             llm = get_parse_llm()
             structured_llm = llm.with_structured_output(IntentParseResult)
             prompt = (
-                "请把用户关于 AFC 智能运维系统的问题解析为结构化字段。"
-                "能力询问、数据概览、高风险设备不需要设备编号；"
-                "设备诊断、风险、历史、建议和预警解释需要设备编号。"
-                f"\n用户问题：{query}"
+                "你是 AFC 智能运维 Agent 的意图解析器。"
+                "必须只输出一个合法 JSON 对象，不允许输出解释性自然语言、Markdown 或多余文本。"
+                "输出必须符合 IntentParseResult 结构。"
+                "JSON 字段只能包含：intent, assetnum, time_window, requires_asset, is_global, confidence。"
+                "intent 只能是 capability_query, data_overview, high_risk_ranking, full_diagnosis, "
+                "risk_query, history_query, advice_query, risk_explanation, risk_and_advice_query。"
+                "如果当前问题没有设备编号，但它是对上一轮设备的追问，请继承 last_assetnum。"
+                "“什么时候再次故障 / 什么时候会复发 / 多久可能再坏 / 大约什么时候会再次故障”归类为 risk_query。"
+                "能力询问、数据概览、高风险设备不需要设备编号；设备诊断、风险、历史、建议和预警解释需要设备编号。"
+                f"\n\n上下文："
+                f"\nlast_assetnum: {last_assetnum or 'null'}"
+                f"\nlast_task_type: {last_task_type or 'null'}"
+                f"\nlast_time_window: {last_time_window or 'null'}"
+                f"\ncontext_hint: {hint or '无'}"
+                f"\n最近对话：\n{recent_messages}"
+                f"\n\n当前用户问题：{query}"
+                "\n\n只输出 JSON。"
             )
             result = structured_llm.invoke([HumanMessage(content=prompt)])
             parsed = _normalize_intent(
