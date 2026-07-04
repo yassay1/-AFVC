@@ -78,9 +78,9 @@ class TestSearchManual:
             content_text = " ".join(r["content"] for r in result["results"])
             assert "扇门" in content_text or "门" in content_text
 
-    def test_search_no_match_returns_fallback(self):
-        """无匹配时应返回默认结果。"""
-        result = search_manual("量子计算故障", top_k=2)
-        assert result["status"] == "success"
-        # 至少返回一些结果（兜底）
-        assert len(result["results"]) >= 0
+    def test_search_no_match_returns_no_match(self):
+        """无匹配时应返回 no_match，不用无关段落兜底。"""
+        result = search_manual("zzzxxyynonmatch", top_k=2)
+        assert result["status"] == "no_match"
+        assert result["results"] == []
+        assert "未在当前维修手册知识库中找到" in result["message"]

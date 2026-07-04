@@ -9,7 +9,7 @@ v0.3.0 升级：
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ── 上下文包 ──────────────────────────────────────────────────
@@ -123,6 +123,45 @@ class QueryUnderstanding(BaseModel):
     confidence: float = Field(
         default=0.7, ge=0.0, le=1.0, description="解析置信度"
     )
+
+    @model_validator(mode="after")
+    def validate_business_consistency(self) -> "QueryUnderstanding":
+        """校验 route/business_goal/assetnum/needs_* 的业务一致性。"""
+        if self.route == "business_device":
+            if not self.business_goal:
+                raise ValueError("route=business_device 时 business_goal 不能为空")
+            if not self.assetnum:
+                raise ValueError("route=business_device 时 assetnum 不能为空；如果没有设备编号应使用 route=needs_clarification")
+            if not self.needs_asset:
+                raise ValueError("route=business_device 时 needs_asset 必须为 true")
+            if not self.needs_tools:
+                raise ValueError("route=business_device 时 needs_tools 必须为 true")
+
+        if self.route == "business_global":
+            if self.business_goal not in {"data_overview", "high_risk_ranking"}:
+                raise ValueError("route=business_global 时 business_goal 必须是 data_overview 或 high_risk_ranking")
+            if self.assetnum:
+                raise ValueError("route=business_global 不应包含 assetnum")
+            if self.needs_asset:
+                raise ValueError("route=business_global 时 needs_asset 必须为 false")
+            if not self.needs_tools:
+                raise ValueError("route=business_global 时 needs_tools 必须为 true")
+
+        if self.route in {"direct_chat", "capability_query", "unsupported"}:
+            if self.needs_tools:
+                raise ValueError(f"route={self.route} 时 needs_tools 必须为 false")
+            if self.needs_asset:
+                raise ValueError(f"route={self.route} 时 needs_asset 必须为 false")
+            if self.business_goal is not None:
+                raise ValueError(f"route={self.route} 时 business_goal 必须为 null")
+
+        if self.route == "needs_clarification":
+            if self.needs_tools:
+                raise ValueError("route=needs_clarification 时 needs_tools 必须为 false")
+            if self.assetnum:
+                raise ValueError("route=needs_clarification 不应包含 assetnum")
+
+        return self
 
 
 # ── 工具计划（v0.3.0 升级）──────────────────────────────────

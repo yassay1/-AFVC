@@ -63,9 +63,16 @@ _REFERENCE_PATTERNS = [
 # 设备切换模式
 _SWITCH_PATTERNS = [
     r"换成?\s*([A-Za-z0-9]{3,})",
+    r"换到\s*([A-Za-z0-9]{3,})",
+    r"换至\s*([A-Za-z0-9]{3,})",
     r"再看下?\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
     r"切换(?:到|成)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
     r"(?:换|改)(?:成|为|到)\s*(?:设备\s*)?([A-Za-z0-9]{3,})",
+]
+
+_BUSINESS_KEYWORDS = [
+    "分析", "风险", "故障", "检查", "建议", "维修", "诊断", "历史", "预警", "巡检",
+    "复发", "再坏", "手册", "规程", "工单",
 ]
 
 
@@ -93,10 +100,11 @@ def _is_global_question(query: str) -> bool:
 
 def _is_chat(query: str) -> bool:
     q = query.lower()
-    # 很短的纯问候
-    if len(query.strip()) <= 4:
-        return True
     return any(kw.lower() in q for kw in _CHAT_KEYWORDS)
+
+
+def _looks_like_business_question(query: str) -> bool:
+    return bool(_extract_assetnum(query)) or any(kw in query for kw in _BUSINESS_KEYWORDS)
 
 
 def _is_unsupported(query: str) -> bool:
@@ -142,7 +150,7 @@ def _detect_route(
         (route, business_goal, assetnum, time_window, needs_asset, needs_rag)
     """
     # 1. 闲聊
-    if _is_chat(query) and not _extract_assetnum(query):
+    if _is_chat(query) and not _looks_like_business_question(query):
         return ("direct_chat", None, None, None, False, False)
 
     # 2. 能力询问
@@ -180,8 +188,7 @@ def _detect_route(
         return ("business_device", bg, active_assetnum, _extract_time_window(query), True, "手册" in query or "规程" in query)
 
     # 8. 看起来像业务问题但缺设备编号
-    biz_keywords = ["分析", "风险", "故障", "检查", "建议", "维修", "诊断", "历史", "预警", "巡检"]
-    if any(kw in query for kw in biz_keywords):
+    if _looks_like_business_question(query):
         if active_assetnum:
             bg = _detect_business_goal(query)
             return ("business_device", bg, active_assetnum, _extract_time_window(query), True, False)
@@ -262,11 +269,21 @@ UNDERSTAND_QUERY_SYSTEM = """你是 AFC 智能运维 Agent 的意图解析器。
 13. "什么时候再次故障/什么时候会复发" → route=business_device, business_goal=device_risk
 14. "那应该先检查什么"等追问 → 继承设备, business_goal=device_advice
 15. 写论文/天气/电影 → route=unsupported
-16. 很短的问候、无业务关键词且无设备编号 → route=direct_chat"""
+16. 很短的问候、无业务关键词且无设备编号 → route=direct_chat
+
+## 字段一致性要求
+
+- 如果当前用户问题中明确出现设备编号，必须原样填写 assetnum，不允许输出 null。
+- 如果 route=business_device，assetnum 必须有值，needs_asset=true，needs_tools=true。
+- 如果用户问“未来30天风险高吗/风险/预测/复发”，business_goal 必须是 device_risk，time_window 应填写 30d。
+- 如果没有设备编号且上下文也没有 active_assetnum，不能输出 route=business_device，应输出 route=needs_clarification。
+- task_type 必须与 route + business_goal 一致，例如 business_device + device_risk → risk_query。"""
 
 
 def _build_understand_prompt(query: str, context_packet: dict[str, Any]) -> str:
     """构建问题理解 Prompt。"""
+    extracted_assetnum = _extract_assetnum(query)
+    extracted_time_window = _extract_time_window(query)
     return (
         f"## 上下文信息\n"
         f"- active_assetnum: {context_packet.get('active_assetnum') or 'null'}\n"
@@ -275,6 +292,10 @@ def _build_understand_prompt(query: str, context_packet: dict[str, Any]) -> str:
         f"- conversation_focus: {context_packet.get('conversation_focus') or '无'}\n"
         f"- known_entities: {json.dumps(context_packet.get('known_entities', []), ensure_ascii=False)}\n"
         f"- recent_messages_summary: {context_packet.get('recent_messages_summary') or '无'}\n"
+        f"\n## 当前问题中的显式抽取提示\n"
+        f"- extracted_assetnum_from_query: {extracted_assetnum or 'null'}\n"
+        f"- extracted_time_window_from_query: {extracted_time_window or 'null'}\n"
+        f"- 注意：如果 extracted_assetnum_from_query 不为 null，输出 JSON 的 assetnum 必须等于该值。\n"
         f"\n## 当前用户问题\n{query}\n"
         f"\n请输出 QueryUnderstanding JSON（只输出 JSON，必须包含 route 和 business_goal 字段）："
     )
@@ -372,6 +393,12 @@ def understand_query_node(state: AfcAgentState) -> dict[str, Any]:
             prompt=prompt,
             schema=QueryUnderstanding,
             system_prompt=UNDERSTAND_QUERY_SYSTEM,
+            repair_context=(
+                f"当前用户问题: {query}\n"
+                f"显式设备编号: {_extract_assetnum(query) or 'null'}\n"
+                f"显式时间窗口: {_extract_time_window(query) or 'null'}\n"
+                f"上下文: {json.dumps(context_packet, ensure_ascii=False, default=str)}"
+            ),
         )
         understanding = result.model_dump()
 
@@ -438,6 +465,7 @@ def _post_process_llm_understanding(
         understanding["needs_tools"] = False
         understanding["needs_asset"] = False
         understanding["business_goal"] = None
+        route = understanding["route"]
 
     # 如果 route 是 direct_chat 但 extract 出了设备编号，可能是误判
     if route == "direct_chat" and _extract_assetnum(query):
@@ -445,11 +473,30 @@ def _post_process_llm_understanding(
         understanding["business_goal"] = _detect_business_goal(query)
         understanding["needs_tools"] = True
         understanding["needs_asset"] = True
+        route = "business_device"
+
+    # 短业务问题（如“风险分析”“故障建议”）不能被 LLM 误归为闲聊。
+    if route == "direct_chat" and _looks_like_business_question(query):
+        active_assetnum = context_packet.get("active_assetnum")
+        understanding["route"] = "business_device" if active_assetnum or _extract_assetnum(query) else "needs_clarification"
+        understanding["business_goal"] = _detect_business_goal(query)
+        understanding["assetnum"] = understanding.get("assetnum") or _extract_assetnum(query) or active_assetnum
+        understanding["needs_asset"] = understanding["route"] == "business_device"
+        understanding["needs_tools"] = understanding["route"] == "business_device"
+        understanding["context_used"] = bool(active_assetnum and understanding.get("assetnum") == active_assetnum)
+        route = understanding["route"]
 
     # 确保非业务 route 的 needs_tools=false
+    route = understanding.get("route", route)
     if route in ("direct_chat", "capability_query", "needs_clarification", "unsupported"):
         understanding["needs_tools"] = False
 
     # 确保有设备编号时 needs_asset=true
+    route = understanding.get("route", route)
     if understanding.get("assetnum") and route == "business_device":
         understanding["needs_asset"] = True
+
+    understanding["task_type"] = route_to_task_type(
+        understanding.get("route", route),
+        understanding.get("business_goal"),
+    )

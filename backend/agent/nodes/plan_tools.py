@@ -191,6 +191,94 @@ def _plan_by_route(
     }
 
 
+TOOL_PLAN_OUTPUT_CONTRACT = """## ToolPlan JSON output contract
+Return exactly one JSON object that validates against ToolPlan.
+
+Root object MUST contain all of these fields:
+- tool_calls: array
+- use_existing_evidence: boolean
+- reason: non-empty string
+- answer_mode: one of direct_chat, capability_intro, ask_for_assetnum, evidence_based, unsupported
+- answer_policy: object
+
+Each item in tool_calls MUST contain all of these fields:
+- tool_name: string, must be one of the available tool names
+- args: object
+- purpose: non-empty string
+- expected_evidence: array of strings
+
+Field name rules:
+- NEVER use a field named "tool".
+- ALWAYS use "tool_name" for the tool name.
+- If repairing invalid JSON that used "tool", rename it to "tool_name" and add any missing required fields.
+"""
+
+
+TOOL_PLAN_JSON_SKELETON = """## Required JSON skeleton
+{
+  "tool_calls": [
+    {
+      "tool_name": "<available_tool_name>",
+      "args": {},
+      "purpose": "<why this tool is needed>",
+      "expected_evidence": ["<evidence_field_name>"]
+    }
+  ],
+  "use_existing_evidence": false,
+  "reason": "<why this plan satisfies the query>",
+  "answer_mode": "evidence_based",
+  "answer_policy": {}
+}
+
+For no-tool plans, use:
+{
+  "tool_calls": [],
+  "use_existing_evidence": true,
+  "reason": "<why no tool is needed>",
+  "answer_mode": "<direct_chat|capability_intro|ask_for_assetnum|unsupported>",
+  "answer_policy": {}
+}
+"""
+
+
+DEVICE_ADVICE_FEW_SHOT = """## Few-shot examples
+Input:
+{
+  "route": "business_device",
+  "business_goal": "device_advice",
+  "assetnum": "1000029970",
+  "needs_tools": true
+}
+
+Correct ToolPlan output:
+{
+  "tool_calls": [
+    {
+      "tool_name": "get_maintenance_advice_tool",
+      "args": {"assetnum": "1000029970"},
+      "purpose": "Get maintenance and inspection advice for device 1000029970.",
+      "expected_evidence": ["maintenance_advice"]
+    }
+  ],
+  "use_existing_evidence": false,
+  "reason": "business_goal=device_advice requires maintenance advice evidence for the target device.",
+  "answer_mode": "evidence_based",
+  "answer_policy": {
+    "must_not_predict_exact_failure_date": true,
+    "must_answer_with_risk_window": false
+  }
+}
+
+Incorrect output, do not imitate:
+{
+  "tool_calls": [
+    {"tool": "get_maintenance_advice_tool", "args": {"assetnum": "1000029970"}}
+  ],
+  "answer_mode": "evidence_based"
+}
+"""
+
+
 PLAN_TOOLS_SYSTEM = """你是 AFC 智能运维 Agent 的工具规划器。
 
 你的任务是：根据问题理解和上下文，规划需要调用的工具并决定 answer_mode。
@@ -222,7 +310,25 @@ PLAN_TOOLS_SYSTEM = """你是 AFC 智能运维 Agent 的工具规划器。
 13. unknown / fallback → 不要默认调用 get_integrated_analysis_tool
 
 ## 输出
-只输出一个合法的 ToolPlan JSON 对象。必须包含 answer_mode 字段。"""
+{output_contract}
+
+{json_skeleton}
+
+{few_shot}
+
+只输出一个合法的 ToolPlan JSON 对象，不要输出 markdown 或解释文字。"""
+
+
+def _build_plan_tools_prompt(query_understanding: dict[str, Any], evidence_packet: dict[str, Any]) -> str:
+    """Build the user prompt for ToolPlan generation."""
+    return (
+        f"{TOOL_PLAN_OUTPUT_CONTRACT}\n"
+        f"{TOOL_PLAN_JSON_SKELETON}\n"
+        f"{DEVICE_ADVICE_FEW_SHOT}\n"
+        f"## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
+        f"\n## 已有证据\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2) if evidence_packet else '无'}\n"
+        "\n请输出完整 ToolPlan JSON。必须使用 tool_name 字段，禁止使用 tool 字段。"
+    )
 
 
 def plan_tools_node(state: AfcAgentState) -> dict[str, Any]:
@@ -262,15 +368,32 @@ def plan_tools_node(state: AfcAgentState) -> dict[str, Any]:
     try:
         llm = get_parse_llm()
         tool_descriptions = _build_tool_descriptions()
-        system_prompt = PLAN_TOOLS_SYSTEM.format(tool_descriptions=tool_descriptions)
-
-        prompt = (
-            f"## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
-            f"\n## 已有证据\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2) if evidence_packet else '无'}\n"
-            f"\n请输出 ToolPlan JSON（只输出 JSON，必须包含 answer_mode）："
+        system_prompt = PLAN_TOOLS_SYSTEM.format(
+            tool_descriptions=tool_descriptions,
+            output_contract=TOOL_PLAN_OUTPUT_CONTRACT,
+            json_skeleton=TOOL_PLAN_JSON_SKELETON,
+            few_shot=DEVICE_ADVICE_FEW_SHOT,
         )
 
-        result = call_llm_json(llm=llm, prompt=prompt, schema=ToolPlan, system_prompt=system_prompt)
+        prompt = _build_plan_tools_prompt(query_understanding, evidence_packet)
+        repair_context = (
+            f"{prompt}\n\n"
+            "Repair reminder: convert any tool_calls[].tool field to tool_calls[].tool_name. "
+            "Every tool call must include tool_name, args, purpose, expected_evidence. "
+            "The root object must include tool_calls, use_existing_evidence, reason, answer_mode, answer_policy. "
+            "Do not return the short schema {tool_calls:[{tool,args}],answer_mode}. "
+            "Use this exact shape:\n"
+            f"{TOOL_PLAN_JSON_SKELETON}"
+        )
+
+        result = call_llm_json(
+            llm=llm,
+            prompt=prompt,
+            schema=ToolPlan,
+            system_prompt=system_prompt,
+            max_repair_attempts=2,
+            repair_context=repair_context,
+        )
         tool_plan = result.model_dump()
     except Exception as exc:
         errors.append(f"LLM 工具规划不可用，使用规则兜底：{str(exc)}")

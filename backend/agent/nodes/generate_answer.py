@@ -22,6 +22,7 @@ from backend.agent.report_builder import (
     build_full_diagnosis_report,
     build_high_risk_report,
     build_history_report,
+    build_manual_report,
     build_risk_advice_report,
     build_risk_explanation_report,
     build_risk_report,
@@ -166,14 +167,7 @@ def _template_by_task(state: AfcAgentState) -> str:
     if task_type == "risk_and_advice_query":
         return build_risk_advice_report(evidence, query)
     if business_goal == "manual_search":
-        manual_evidence = evidence.get("manual_evidence")
-        if not manual_evidence:
-            return (
-                f"【AFC 维修手册检索】\n\n设备 {assetnum} 维修手册检索未返回结果。\n"
-                f"当前知识库可能缺少相关手册文件。\n\n"
-                f"建议：请将维护手册 .txt/.md 放入 backend/data/knowledge/manuals 目录。"
-            )
-        return build_advice_report(evidence, query)
+        return build_manual_report(evidence, query)
     # 默认完整诊断
     return build_full_diagnosis_report(evidence, query)
 
@@ -262,6 +256,13 @@ def generate_answer_node(state: AfcAgentState) -> dict[str, Any]:
     if has_missing_asset_error and not evidence_packet.get("sources"):
         return {
             "final_answer": _ask_for_assetnum_answer(),
+            "errors": errors,
+        }
+
+    if query_understanding.get("business_goal") == "manual_search":
+        final_answer = _template_by_task(state)
+        return {
+            "final_answer": _auto_append_boundary(final_answer),
             "errors": errors,
         }
 

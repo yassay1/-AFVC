@@ -25,6 +25,7 @@ from backend.services.prediction_service import (
 from backend.services.warning_service import generate_warning_info
 from backend.services.advice_service import generate_device_advice
 from backend.services.analysis_service import generate_device_analysis
+from backend.services import model_adapter
 
 # ── 测试常量（基于真实数据中的设备） ──
 KNOWN_ASSETNUM = "1000029970"   # 花地湾站，163 条工单
@@ -155,6 +156,34 @@ class TestPredictionService:
         # 应按风险降序
         if len(devices) >= 2:
             assert devices[0]["risk_90d"] >= devices[1]["risk_90d"]
+
+    def test_external_prediction_invalid_values_are_sanitized(self, monkeypatch):
+        """外部 CSV 风险值非法时不应导致读取崩溃。"""
+        csv_path = Path(__file__).resolve().parent / "_tmp_prediction_results.csv"
+        try:
+            csv_path.write_text(
+                "assetnum,risk_7d,risk_14d,risk_21d,risk_30d,risk_60d,risk_90d\n"
+                "BAD001,NaN,abc,-0.2,1.8,,inf\n"
+                "BAD002,0.2,0.3,0.4,0.5,0.6,0.7\n",
+                encoding="utf-8",
+            )
+            monkeypatch.setattr(model_adapter, "PREDICTION_RESULT_PATH", csv_path)
+
+            result = model_adapter.get_external_prediction_by_assetnum("BAD001")
+            assert result is not None
+            for window in ["risk_7d", "risk_14d", "risk_21d", "risk_30d", "risk_60d", "risk_90d"]:
+                assert 0.01 <= result[window] <= 0.95
+                assert round(result[window], 2) == result[window]
+
+            assert result["risk_21d"] == 0.01
+            assert result["risk_30d"] == 0.95
+
+            ranked = model_adapter.get_external_high_risk_predictions(top_n=2)
+            assert len(ranked) == 2
+            assert ranked[0]["risk_90d"] >= ranked[1]["risk_90d"]
+        finally:
+            if csv_path.exists():
+                csv_path.unlink()
 
 
 # ═══════════════════════════════════════════════════════════════

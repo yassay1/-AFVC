@@ -215,6 +215,51 @@ def build_advice_report(evidence: dict[str, Any], query: str) -> str:
     return "\n".join(lines)
 
 
+def build_manual_report(evidence: dict[str, Any], query: str) -> str:
+    """生成维修手册检索报告。"""
+    manual_evidence = evidence.get("manual_evidence") or []
+    assetnum = evidence.get("assetnum")
+
+    lines = ["【AFC 维修手册检索报告】", ""]
+    if assetnum:
+        lines.append(f"- 设备编号：{assetnum}")
+    lines.append(f"- 原始问题：{query}")
+    lines.append("")
+
+    if not manual_evidence:
+        lines.append("未在当前维修手册知识库中找到足够相关的内容。")
+        lines.append("")
+        lines.append("建议：")
+        lines.append("- 换用更具体的故障现象关键词，例如“票卡不接收”“扇门异常”“读卡失败”。")
+        lines.append("- 检查 backend/data/knowledge/manuals 目录中是否已放入对应手册文件。")
+        lines.extend(_scientific_boundary_lines())
+        lines.append("")
+        lines.append(f"工具来源：{', '.join(evidence.get('sources', []))}")
+        return "\n".join(lines)
+
+    lines.append(f"共匹配到 {len(manual_evidence)} 条手册证据：")
+    lines.append("")
+    for i, item in enumerate(manual_evidence, 1):
+        title = item.get("title") or "未命名章节"
+        source = item.get("source") or "未知来源"
+        score = item.get("score", "N/A")
+        content = str(item.get("content") or "").strip()
+        if len(content) > 260:
+            content = content[:260].rstrip() + "..."
+
+        lines.append(f"## {i}. {title}")
+        lines.append(f"- 来源文件：{source}")
+        lines.append(f"- 匹配分数：{score}")
+        lines.append(f"- 内容摘要：{content or '内容为空'}")
+        lines.append("")
+
+    lines.extend(_scientific_boundary_lines())
+    lines.append("")
+    lines.append("说明：手册检索结果用于辅助定位检查方向，不能替代现场检测、设备日志和维修人员判断。")
+    lines.append(f"工具来源：{', '.join(evidence.get('sources', []))}")
+    return "\n".join(lines)
+
+
 def build_risk_explanation_report(evidence: dict[str, Any], query: str) -> str:
     """生成预警原因解释报告。"""
     return build_risk_report(evidence, query).replace("【AFC 设备风险预测说明】", "【AFC 预警原因解释】", 1)

@@ -130,6 +130,7 @@ def repair_json_output(
     error_message: str,
     target_schema: type[BaseModel],
     llm=None,
+    repair_context: str | None = None,
 ) -> dict[str, Any]:
     """当 LLM 输出无法解析为合法 JSON 时，让 LLM 修复一次。
 
@@ -151,6 +152,8 @@ def repair_json_output(
         "但 JSON 解析或 Pydantic 校验失败了。\n\n"
         "## 原始 LLM 输出\n"
         f"{raw_output}\n\n"
+        + (f"## 原始任务上下文\n{repair_context}\n\n" if repair_context else "")
+        +
         "## 错误信息\n"
         f"{error_message}\n\n"
         "## 目标 Schema\n"
@@ -181,6 +184,7 @@ def call_llm_json(
     schema: type[BaseModel],
     system_prompt: str = "你是一个结构化输出助手。只输出符合要求的 JSON 对象。",
     max_repair_attempts: int = 1,
+    repair_context: str | None = None,
 ) -> BaseModel:
     """统一的 LLM → JSON → Pydantic 调用。
 
@@ -236,6 +240,7 @@ def call_llm_json(
                 error_message=errors[-1],
                 target_schema=schema,
                 llm=llm,
+                repair_context=repair_context or prompt,
             )
             result = parse_json_with_schema(repaired_data, schema)
             logger.debug("修复第 %d 次成功（schema=%s）", attempt + 1, schema.__name__)

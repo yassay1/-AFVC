@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # ── 手册目录 ────────────────────────────────────────────────────────
 
 MANUALS_DIR = Path(__file__).resolve().parent.parent / "data" / "knowledge" / "manuals"
+MIN_MATCH_SCORE = 0.1
 
 
 def _get_manual_files() -> list[Path]:
@@ -190,7 +191,7 @@ def search_manual(
         content_score = _keyword_score(search_query, chunk.get("content", ""))
         # 综合评分：内容权重更高
         score = title_score * 0.3 + content_score * 0.7
-        if score > 0:
+        if score >= MIN_MATCH_SCORE:
             scored.append({
                 "content": chunk["content"],
                 "title": chunk.get("title", ""),
@@ -204,17 +205,14 @@ def search_manual(
     # 取 top_k
     results = scored[:top_k]
 
-    # 如果没有匹配，返回前几个段落作为参考
-    if not results and all_chunks:
-        results = [
-            {
-                "content": chunk["content"][:200] + "...",
-                "title": chunk.get("title", "概述"),
-                "source": chunk.get("source", ""),
-                "score": 0.1,
-            }
-            for chunk in all_chunks[:min(top_k, 3)]
-        ]
+    if not results:
+        return {
+            "status": "no_match",
+            "message": "未在当前维修手册知识库中找到与问题足够相关的内容，请尝试更具体的故障现象关键词。",
+            "query": query,
+            "total_documents": len(manual_files),
+            "results": [],
+        }
 
     return {
         "status": "success",

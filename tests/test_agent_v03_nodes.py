@@ -1,6 +1,7 @@
 """测试 Agent v0.3 八节点基本功能。"""
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from backend.agent.state import AfcAgentState, create_initial_state, CAPABILITY_BOUNDARY
 from backend.agent.nodes.prepare_context import prepare_context_node
@@ -60,7 +61,45 @@ class TestUnderstandQuery:
     def test_device_switch_detection(self):
         assert _has_device_switch("换成 EX011115 呢？") == "EX011115"
         assert _has_device_switch("切换成设备 EX011115") == "EX011115"
+        assert _has_device_switch("换到 GX010301") == "GX010301"
         assert _has_device_switch("那它风险高吗") is None
+
+    def test_short_business_query_is_not_chat(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.agent.nodes.understand_query.get_parse_llm",
+            lambda: (_ for _ in ()).throw(RuntimeError("disable llm")),
+        )
+        state = create_initial_state("风险分析")
+        state["context_packet"] = {
+            "active_assetnum": None,
+            "active_task_type": None,
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+        assert understanding["route"] == "needs_clarification"
+        assert understanding["needs_tools"] is False
+
+    def test_switch_to_device_expression(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.agent.nodes.understand_query.get_parse_llm",
+            lambda: (_ for _ in ()).throw(RuntimeError("disable llm")),
+        )
+        state = create_initial_state("换到 GX010301")
+        state["context_packet"] = {
+            "active_assetnum": KNOWN_ASSETNUM,
+            "active_task_type": "full_diagnosis",
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [KNOWN_ASSETNUM],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+        assert understanding["route"] == "business_device"
+        assert understanding["assetnum"] == "GX010301"
+        assert understanding["needs_tools"] is True
 
     def test_understand_with_pronoun_inheritance(self):
         state = create_initial_state("那它最近有哪些故障？")
@@ -110,6 +149,80 @@ class TestUnderstandQuery:
         assert understanding["needs_asset"] is False
         assert understanding["business_goal"] in ("high_risk_ranking", "data_overview", None)
 
+    def test_inconsistent_llm_output_is_repaired_with_original_query(self, monkeypatch):
+        class FakeRepairLLM:
+            def __init__(self):
+                self.calls = 0
+                self.repair_prompt = ""
+
+            def invoke(self, messages):
+                self.calls += 1
+                text = "\n".join(str(getattr(m, "content", m)) for m in messages)
+                if self.calls == 1:
+                    return AIMessage(content="""{
+                        "route": "business_device",
+                        "business_goal": "device_risk",
+                        "task_type": "risk_query",
+                        "assetnum": null,
+                        "time_window": null,
+                        "needs_asset": false,
+                        "needs_tools": true,
+                        "needs_rag": false,
+                        "context_used": false,
+                        "information_need": "查询设备风险",
+                        "user_question_rewrite": "设备 1000029970 未来30天风险高吗？",
+                        "confidence": 0.9
+                    }""")
+                self.repair_prompt = text
+                return AIMessage(content="""{
+                    "route": "business_device",
+                    "business_goal": "device_risk",
+                    "task_type": "risk_query",
+                    "assetnum": "1000029970",
+                    "time_window": "30d",
+                    "needs_asset": true,
+                    "needs_tools": true,
+                    "needs_rag": false,
+                    "context_used": false,
+                    "information_need": "查询设备 1000029970 未来30天风险",
+                    "user_question_rewrite": "设备 1000029970 未来30天风险高吗？",
+                    "confidence": 0.95
+                }""")
+
+        fake = FakeRepairLLM()
+        monkeypatch.setattr("backend.agent.nodes.understand_query.get_parse_llm", lambda: fake)
+        monkeypatch.setattr(
+            "backend.agent.nodes.plan_tools.get_parse_llm",
+            lambda: (_ for _ in ()).throw(RuntimeError("disable plan llm")),
+        )
+
+        state = create_initial_state("设备 1000029970 未来30天风险高吗？")
+        state["context_packet"] = {
+            "active_assetnum": None,
+            "active_task_type": None,
+            "capability_boundary": CAPABILITY_BOUNDARY,
+            "known_entities": [],
+            "recent_messages": [],
+        }
+        result = understand_query_node(state)
+        understanding = result["query_understanding"]
+
+        assert fake.calls == 2
+        assert "当前用户问题: 设备 1000029970 未来30天风险高吗？" in fake.repair_prompt
+        assert understanding["route"] == "business_device"
+        assert understanding["business_goal"] == "device_risk"
+        assert understanding["task_type"] == "risk_query"
+        assert understanding["assetnum"] == "1000029970"
+        assert understanding["time_window"] == "30d"
+        assert understanding["needs_asset"] is True
+        assert understanding["needs_tools"] is True
+
+        state["query_understanding"] = understanding
+        plan_result = plan_tools_node(state)
+        tool_calls = plan_result["tool_plan"]["tool_calls"]
+        assert tool_calls[0]["tool_name"] == "predict_device_risk_tool"
+        assert tool_calls[0]["args"]["assetnum"] == "1000029970"
+
 
 class TestPlanTools:
     """测试 plan_tools_node。"""
@@ -155,6 +268,137 @@ class TestPlanTools:
         result = plan_tools_node(state)
         tool_names = [tc["tool_name"] for tc in result["tool_plan"]["tool_calls"]]
         assert "get_maintenance_advice_tool" in tool_names
+
+    def test_plan_tools_repair_converts_tool_field_to_tool_name(self, monkeypatch):
+        class FakeRepairLLM:
+            def __init__(self):
+                self.calls = 0
+                self.repair_prompt = ""
+
+            def invoke(self, messages):
+                self.calls += 1
+                text = "\n".join(str(getattr(m, "content", m)) for m in messages)
+                if self.calls == 1:
+                    return AIMessage(content="""{
+                        "tool_calls": [
+                            {
+                                "tool": "get_maintenance_advice_tool",
+                                "args": {"assetnum": "1000029970"}
+                            }
+                        ],
+                        "answer_mode": "evidence_based"
+                    }""")
+
+                self.repair_prompt = text
+                return AIMessage(content="""{
+                    "tool_calls": [
+                        {
+                            "tool_name": "get_maintenance_advice_tool",
+                            "args": {"assetnum": "1000029970"},
+                            "purpose": "Get maintenance advice for device 1000029970.",
+                            "expected_evidence": ["maintenance_advice"]
+                        }
+                    ],
+                    "use_existing_evidence": false,
+                    "reason": "business_goal=device_advice requires maintenance advice evidence.",
+                    "answer_mode": "evidence_based",
+                    "answer_policy": {
+                        "must_not_predict_exact_failure_date": true,
+                        "must_answer_with_risk_window": false
+                    }
+                }""")
+
+        fake = FakeRepairLLM()
+        monkeypatch.setattr("backend.agent.nodes.plan_tools.get_parse_llm", lambda: fake)
+        monkeypatch.setattr(
+            "backend.agent.nodes.plan_tools._plan_by_route",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rule fallback must not be used")),
+        )
+
+        state = create_initial_state(f"设备 {KNOWN_ASSETNUM} 应该先检查什么")
+        state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "device_advice",
+            "task_type": "advice_query",
+            "assetnum": KNOWN_ASSETNUM,
+            "needs_asset": True,
+            "needs_tools": True,
+        }
+
+        result = plan_tools_node(state)
+        tool_plan = result["tool_plan"]
+        tool_call = tool_plan["tool_calls"][0]
+
+        assert fake.calls == 2
+        assert "NEVER use a field named \"tool\"" in fake.repair_prompt
+        assert "convert any tool_calls[].tool field to tool_calls[].tool_name" in fake.repair_prompt
+        assert tool_call["tool_name"] == "get_maintenance_advice_tool"
+        assert tool_call["args"]["assetnum"] == KNOWN_ASSETNUM
+        assert tool_call["purpose"]
+        assert tool_call["expected_evidence"] == ["maintenance_advice"]
+        assert tool_plan["reason"]
+        assert result["errors"] == []
+
+    def test_plan_tools_allows_second_repair_without_rule_fallback(self, monkeypatch):
+        class FakeTwoRepairLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                if self.calls in (1, 2):
+                    return AIMessage(content="""{
+                        "tool_calls": [
+                            {
+                                "tool": "get_maintenance_advice_tool",
+                                "args": {"assetnum": "1000029970"}
+                            }
+                        ],
+                        "answer_mode": "evidence_based"
+                    }""")
+
+                return AIMessage(content="""{
+                    "tool_calls": [
+                        {
+                            "tool_name": "get_maintenance_advice_tool",
+                            "args": {"assetnum": "1000029970"},
+                            "purpose": "Get maintenance advice for device 1000029970.",
+                            "expected_evidence": ["maintenance_advice"]
+                        }
+                    ],
+                    "use_existing_evidence": false,
+                    "reason": "The user asked for device maintenance advice.",
+                    "answer_mode": "evidence_based",
+                    "answer_policy": {
+                        "must_not_predict_exact_failure_date": true,
+                        "must_answer_with_risk_window": false
+                    }
+                }""")
+
+        fake = FakeTwoRepairLLM()
+        monkeypatch.setattr("backend.agent.nodes.plan_tools.get_parse_llm", lambda: fake)
+        monkeypatch.setattr(
+            "backend.agent.nodes.plan_tools._plan_by_route",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rule fallback must not be used")),
+        )
+
+        state = create_initial_state(f"设备 {KNOWN_ASSETNUM} 应该先检查什么")
+        state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "device_advice",
+            "task_type": "advice_query",
+            "assetnum": KNOWN_ASSETNUM,
+            "needs_asset": True,
+            "needs_tools": True,
+        }
+
+        result = plan_tools_node(state)
+        tool_call = result["tool_plan"]["tool_calls"][0]
+
+        assert fake.calls == 3
+        assert tool_call["tool_name"] == "get_maintenance_advice_tool"
+        assert tool_call["purpose"]
+        assert result["errors"] == []
 
     def test_plan_full_diagnosis(self):
         state = create_initial_state(f"帮我分析设备 {KNOWN_ASSETNUM}")
@@ -294,6 +538,36 @@ class TestGenerateAnswer:
         }
         result = generate_answer_node(state)
         assert len(result["final_answer"]) > 10
+
+    def test_manual_search_report_shows_evidence(self):
+        state = create_initial_state("按维修手册查票卡不接收")
+        state["query_understanding"] = {
+            "route": "business_device",
+            "business_goal": "manual_search",
+            "task_type": "manual_query",
+            "assetnum": KNOWN_ASSETNUM,
+            "needs_asset": True,
+        }
+        state["tool_plan"] = {"answer_mode": "evidence_based"}
+        state["evidence_packet"] = {
+            "assetnum": KNOWN_ASSETNUM,
+            "manual_evidence": [
+                {
+                    "title": "票卡不接收处理",
+                    "source": "manual.md",
+                    "score": 0.87,
+                    "content": "检查票卡通道、读写器连接和传感器状态。",
+                }
+            ],
+            "sources": ["search_maintenance_manual_tool"],
+        }
+        result = generate_answer_node(state)
+        answer = result["final_answer"]
+        assert "维修手册检索报告" in answer
+        assert "票卡不接收处理" in answer
+        assert "manual.md" in answer
+        assert "0.87" in answer
+        assert "检查票卡通道" in answer
 
 
 class TestUpdateMemory:
