@@ -168,13 +168,16 @@ def get_external_high_risk_predictions(top_n: int = 10) -> list[dict[str, Any]]:
         .filter(pl.col("assetnum") != "")
     )
 
+    # Convert all rows first — sanitisation must happen before sorting
+    # because raw CSV values (NaN, inf, abc) can't be compared at the
+    # Polars level when infer_schema_length=0 keeps everything as strings.
     records = result_df.to_dicts()
-    sanitized_records = [
+    sanitized = [
         {
             **_prediction_record_from_row(row),
             "model_source": "external_prediction_csv",
         }
         for row in records
     ]
-    sanitized_records.sort(key=lambda row: (row["risk_90d"], row["risk_30d"]), reverse=True)
-    return sanitized_records[:top_n]
+    sanitized.sort(key=lambda r: (r["risk_90d"], r["risk_30d"]), reverse=True)
+    return sanitized[:top_n]

@@ -275,7 +275,7 @@ UNDERSTAND_QUERY_SYSTEM = """你是 AFC 智能运维 Agent 的意图解析器。
 
 - 如果当前用户问题中明确出现设备编号，必须原样填写 assetnum，不允许输出 null。
 - 如果 route=business_device，assetnum 必须有值，needs_asset=true，needs_tools=true。
-- 如果用户问“未来30天风险高吗/风险/预测/复发”，business_goal 必须是 device_risk，time_window 应填写 30d。
+- 如果用户问"未来30天风险高吗/风险/预测/复发"，business_goal 必须是 device_risk，time_window 应填写 30d。
 - 如果没有设备编号且上下文也没有 active_assetnum，不能输出 route=business_device，应输出 route=needs_clarification。
 - task_type 必须与 route + business_goal 一致，例如 business_device + device_risk → risk_query。"""
 
@@ -456,47 +456,53 @@ def _post_process_llm_understanding(
     query: str,
     context_packet: dict[str, Any],
 ) -> None:
-    """对 LLM 输出的 understanding 做安全后处理。"""
+    """Correct LLM misclassifications in the QueryUnderstanding output.
+
+    Two corrections are applied when LLM outputs route=direct_chat:
+
+    1. query contains an explicit assetnum -> route should be business_device
+    2. query looks like a business question -> route should be business_device
+       (if assetnum available from context/query) or needs_clarification
+       (if no assetnum available at all).
+
+    Also ensures non-business routes have needs_tools=False.
+    """
     route = understanding.get("route", "direct_chat")
 
-    # 如果 route=unknown 但看起来像闲聊，修正
+    # ── Step 1: correct direct_chat misclassifications ──
+    if route == "direct_chat":
+        active_assetnum = context_packet.get("active_assetnum")
+        if _looks_like_business_question(query):
+            understanding["route"] = (
+                "business_device"
+                if (active_assetnum or _extract_assetnum(query))
+                else "needs_clarification"
+            )
+            understanding["business_goal"] = _detect_business_goal(query)
+            understanding["assetnum"] = understanding.get("assetnum") or _extract_assetnum(query) or active_assetnum
+            understanding["needs_asset"] = understanding["route"] == "business_device"
+            understanding["needs_tools"] = understanding["route"] == "business_device"
+            understanding["context_used"] = bool(
+                active_assetnum and understanding.get("assetnum") == active_assetnum
+            )
+
+    # ── Step 1.5: correct unsupported→chat ──
     if route == "unsupported" and (_is_chat(query) or _is_capability_question(query)):
         understanding["route"] = "direct_chat" if _is_chat(query) else "capability_query"
         understanding["needs_tools"] = False
         understanding["needs_asset"] = False
         understanding["business_goal"] = None
-        route = understanding["route"]
 
-    # 如果 route 是 direct_chat 但 extract 出了设备编号，可能是误判
-    if route == "direct_chat" and _extract_assetnum(query):
-        understanding["route"] = "business_device"
-        understanding["business_goal"] = _detect_business_goal(query)
-        understanding["needs_tools"] = True
-        understanding["needs_asset"] = True
-        route = "business_device"
-
-    # 短业务问题（如“风险分析”“故障建议”）不能被 LLM 误归为闲聊。
-    if route == "direct_chat" and _looks_like_business_question(query):
-        active_assetnum = context_packet.get("active_assetnum")
-        understanding["route"] = "business_device" if active_assetnum or _extract_assetnum(query) else "needs_clarification"
-        understanding["business_goal"] = _detect_business_goal(query)
-        understanding["assetnum"] = understanding.get("assetnum") or _extract_assetnum(query) or active_assetnum
-        understanding["needs_asset"] = understanding["route"] == "business_device"
-        understanding["needs_tools"] = understanding["route"] == "business_device"
-        understanding["context_used"] = bool(active_assetnum and understanding.get("assetnum") == active_assetnum)
-        route = understanding["route"]
-
-    # 确保非业务 route 的 needs_tools=false
-    route = understanding.get("route", route)
-    if route in ("direct_chat", "capability_query", "needs_clarification", "unsupported"):
+    # ── Step 2: enforce non-business route invariants ──
+    if understanding.get("route") in ("direct_chat", "capability_query", "needs_clarification", "unsupported"):
         understanding["needs_tools"] = False
 
-    # 确保有设备编号时 needs_asset=true
-    route = understanding.get("route", route)
-    if understanding.get("assetnum") and route == "business_device":
+    # ── Step 3: ensure needs_asset when assetnum present ──
+    if understanding.get("assetnum") and understanding.get("route") == "business_device":
         understanding["needs_asset"] = True
 
+    # ── Step 4: sync task_type ──
     understanding["task_type"] = route_to_task_type(
-        understanding.get("route", route),
+        understanding.get("route", "direct_chat"),
         understanding.get("business_goal"),
     )

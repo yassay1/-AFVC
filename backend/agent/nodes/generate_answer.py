@@ -259,6 +259,7 @@ def generate_answer_node(state: AfcAgentState) -> dict[str, Any]:
             "errors": errors,
         }
 
+    # manual_search always uses the template builder for consistent formatting
     if query_understanding.get("business_goal") == "manual_search":
         final_answer = _template_by_task(state)
         return {
