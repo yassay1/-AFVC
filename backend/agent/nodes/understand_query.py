@@ -14,11 +14,9 @@ import json
 import re
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from backend.agent.llm_json import call_llm_json
 from backend.agent.schemas import QueryUnderstanding, route_to_task_type
-from backend.agent.state import AfcAgentState, NO_DEVICE_ROUTES
+from backend.agent.state import AfcAgentState
 from backend.core.llm import get_parse_llm
 
 
@@ -277,7 +275,68 @@ UNDERSTAND_QUERY_SYSTEM = """你是 AFC 智能运维 Agent 的意图解析器。
 - 如果 route=business_device，assetnum 必须有值，needs_asset=true，needs_tools=true。
 - 如果用户问"未来30天风险高吗/风险/预测/复发"，business_goal 必须是 device_risk，time_window 应填写 30d。
 - 如果没有设备编号且上下文也没有 active_assetnum，不能输出 route=business_device，应输出 route=needs_clarification。
-- task_type 必须与 route + business_goal 一致，例如 business_device + device_risk → risk_query。"""
+- task_type 必须与 route + business_goal 一致，例如 business_device + device_risk → risk_query。
+
+## QueryUnderstanding JSON Schema
+
+根对象必须直接包含以下字段：
+- route: string，direct_chat/capability_query/business_global/business_device/needs_clarification/unsupported 之一
+- business_goal: string 或 null，data_overview/high_risk_ranking/device_risk/device_history/device_advice/full_diagnosis/manual_search 之一
+- task_type: string，与 route + business_goal 保持一致
+- assetnum: string 或 null
+- time_window: string 或 null
+- needs_asset: boolean
+- needs_tools: boolean
+- needs_rag: boolean
+- context_used: boolean
+- information_need: string
+- user_question_rewrite: string
+- confidence: number，0 到 1 之间
+
+## 正确输出样例
+
+{
+  "route": "business_device",
+  "business_goal": "device_risk",
+  "task_type": "risk_query",
+  "assetnum": "1000029970",
+  "time_window": "30d",
+  "needs_asset": true,
+  "needs_tools": true,
+  "needs_rag": false,
+  "context_used": false,
+  "information_need": "查询设备 1000029970 的未来30天复发风险",
+  "user_question_rewrite": "查询设备 1000029970 未来30天复发风险",
+  "confidence": 0.95
+}
+
+## 输出
+只输出 QueryUnderstanding JSON。不要输出 markdown、解释文字或节点状态包装对象。"""
+
+
+UNDERSTAND_OUTPUT_CONTRACT = """## 最终输出格式要求
+只输出一个合法 JSON object，不要 markdown，不要解释文字。
+JSON 根对象必须直接包含这些字段：
+route, business_goal, task_type, assetnum, time_window, needs_asset, needs_tools, needs_rag, context_used, information_need, user_question_rewrite, confidence。
+不要增加任何外层包装字段，不要输出节点状态对象。
+字段类型必须符合 QueryUnderstanding；boolean 字段必须输出 true/false；business_goal 和 assetnum 允许为 null。
+"""
+
+
+UNDERSTAND_JSON_SKELETON = """{
+  "route": "business_device",
+  "business_goal": "device_risk",
+  "task_type": "risk_query",
+  "assetnum": "ASSETNUM_FROM_QUERY",
+  "time_window": "30d",
+  "needs_asset": true,
+  "needs_tools": true,
+  "needs_rag": false,
+  "context_used": false,
+  "information_need": "查询设备复发风险",
+  "user_question_rewrite": "查询目标设备未来30天复发风险",
+  "confidence": 0.95
+}"""
 
 
 def _build_understand_prompt(query: str, context_packet: dict[str, Any]) -> str:
@@ -297,7 +356,8 @@ def _build_understand_prompt(query: str, context_packet: dict[str, Any]) -> str:
         f"- extracted_time_window_from_query: {extracted_time_window or 'null'}\n"
         f"- 注意：如果 extracted_assetnum_from_query 不为 null，输出 JSON 的 assetnum 必须等于该值。\n"
         f"\n## 当前用户问题\n{query}\n"
-        f"\n请输出 QueryUnderstanding JSON（只输出 JSON，必须包含 route 和 business_goal 字段）："
+        f"\n{UNDERSTAND_OUTPUT_CONTRACT}"
+        f"\n## JSON skeleton\n{UNDERSTAND_JSON_SKELETON}\n"
     )
 
 
@@ -388,17 +448,26 @@ def understand_query_node(state: AfcAgentState) -> dict[str, Any]:
     try:
         llm = get_parse_llm()
         prompt = _build_understand_prompt(query, context_packet)
+        repair_context = (
+            f"当前用户问题: {query}\n"
+            f"显式设备编号: {_extract_assetnum(query) or 'null'}\n"
+            f"显式时间窗口: {_extract_time_window(query) or 'null'}\n"
+            f"上下文: {json.dumps(context_packet, ensure_ascii=False, default=str)}\n\n"
+            f"{prompt}\n\n"
+            "Repair reminder: output the QueryUnderstanding root JSON object only. "
+            "The root fields must be route, business_goal, task_type, assetnum, time_window, "
+            "needs_asset, needs_tools, needs_rag, context_used, information_need, "
+            "user_question_rewrite, and confidence. Do not wrap the object in any state or node field. "
+            "Use this exact shape:\n"
+            f"{UNDERSTAND_JSON_SKELETON}"
+        )
         result = call_llm_json(
             llm=llm,
             prompt=prompt,
             schema=QueryUnderstanding,
             system_prompt=UNDERSTAND_QUERY_SYSTEM,
-            repair_context=(
-                f"当前用户问题: {query}\n"
-                f"显式设备编号: {_extract_assetnum(query) or 'null'}\n"
-                f"显式时间窗口: {_extract_time_window(query) or 'null'}\n"
-                f"上下文: {json.dumps(context_packet, ensure_ascii=False, default=str)}"
-            ),
+            max_repair_attempts=2,
+            repair_context=repair_context,
         )
         understanding = result.model_dump()
 

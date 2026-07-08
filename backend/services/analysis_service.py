@@ -128,6 +128,7 @@ def generate_device_analysis(assetnum: str, history_limit: int = 50) -> dict[str
         "possible_causes": advice_result.get("possible_causes", []),
         "inspection_suggestions": advice_result.get("inspection_suggestions", []),
         "spare_part_suggestions": advice_result.get("spare_part_suggestions", []),
+        "maintenance_sop": advice_result.get("maintenance_sop", {}),
         "recent_descriptions_used": advice_result.get("recent_descriptions", []),
     }
 

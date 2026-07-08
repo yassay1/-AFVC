@@ -125,6 +125,68 @@ def _device_header(evidence: dict[str, Any]) -> list[str]:
     ]
 
 
+def _sop_has_content(sop: dict[str, Any]) -> bool:
+    if not isinstance(sop, dict):
+        return False
+    return any(bool(sop.get(key)) for key in [
+        "priority_order",
+        "onsite_steps",
+        "abnormal_criteria",
+        "repair_actions",
+        "verification_steps",
+        "escalation_conditions",
+    ])
+
+
+def _append_numbered_items(lines: list[str], items: list[Any]) -> None:
+    if not items:
+        lines.append("- 工具未返回该项数据")
+        return
+
+    for i, item in enumerate(items, 1):
+        lines.append(f"{i}. {item}")
+
+
+def _append_maintenance_sop_sections(lines: list[str], advice: dict[str, Any]) -> None:
+    sop = advice.get("maintenance_sop", {}) or {}
+    spares = advice.get("spare_part_suggestions", []) or []
+
+    lines.extend(["", "## 维修建议", "", "### 1. 优先排查顺序"])
+    priority_order = sop.get("priority_order", []) or []
+    if priority_order:
+        lines.append(" → ".join(str(item) for item in priority_order))
+    else:
+        lines.append("- 工具未返回优先排查顺序")
+
+    section_map = [
+        ("### 2. 现场排查步骤", "onsite_steps"),
+        ("### 3. 异常判定标准", "abnormal_criteria"),
+        ("### 4. 处理动作", "repair_actions"),
+    ]
+    for title, key in section_map:
+        lines.extend(["", title])
+        _append_numbered_items(lines, sop.get(key, []) or [])
+
+    lines.extend(["", "### 5. 推荐备件"])
+    if spares:
+        for item in spares:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 根据现场检查结果准备对应模块备件")
+
+    tail_sections = [
+        ("### 6. 维修后复测", "verification_steps"),
+        ("### 7. 升级处理条件", "escalation_conditions"),
+    ]
+    for title, key in tail_sections:
+        lines.extend(["", title])
+        _append_numbered_items(lines, sop.get(key, []) or [])
+
+    advice_note = advice.get("advice_note")
+    if advice_note:
+        lines.extend(["", "### 注意事项", f"- {advice_note}"])
+
+
 def build_risk_report(evidence: dict[str, Any], query: str) -> str:
     """生成单设备风险查询报告。"""
     risk = evidence.get("risk_prediction", {}) or {}
@@ -195,6 +257,13 @@ def build_advice_report(evidence: dict[str, Any], query: str) -> str:
 
     lines = ["【AFC 维修与巡检建议】", "", "一、设备信息"]
     lines.extend(_device_header(evidence))
+    if _sop_has_content(advice.get("maintenance_sop", {}) or {}):
+        _append_maintenance_sop_sections(lines, advice)
+        lines.extend(_scientific_boundary_lines())
+        lines.append("")
+        lines.append(f"工具来源：{', '.join(evidence.get('sources', []))}")
+        return "\n".join(lines)
+
     sections = [
         ("二、识别到的故障现象", advice.get("recognized_fault_phenomena", [])),
         ("三、可能原因", advice.get("possible_causes", [])),
@@ -316,10 +385,13 @@ def build_full_diagnosis_report(evidence: dict[str, Any], query: str) -> str:
         "",
         "五、维修与巡检建议",
     ])
-    for item in advice.get("inspection_suggestions", [])[:5]:
-        lines.append(f"- {item}")
-    if not advice.get("inspection_suggestions"):
-        lines.append("- 工具未返回维修建议")
+    if _sop_has_content(advice.get("maintenance_sop", {}) or {}):
+        _append_maintenance_sop_sections(lines, advice)
+    else:
+        for item in advice.get("inspection_suggestions", [])[:5]:
+            lines.append(f"- {item}")
+        if not advice.get("inspection_suggestions"):
+            lines.append("- 工具未返回维修建议")
 
     lines.extend(["", "六、工具调用记录"])
     for tool in evidence.get("sources", []):

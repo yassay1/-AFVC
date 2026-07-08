@@ -51,8 +51,51 @@ EVALUATE_SYSTEM = """你是 AFC 智能运维 Agent 的证据评估器。
 9. 如果所有工具都失败了且没有有效证据 → answerable=false, need_more_tools=false
    （不要无限循环）
 
+## EvidenceEvaluation JSON Schema
+
+根对象必须直接包含以下字段：
+- answerable: boolean，当前证据是否足够回答用户问题
+- need_more_tools: boolean，是否还需要补充工具调用
+- missing_evidence: array[string]，缺失的证据类型；没有缺失时输出 []
+- suggested_next_tools: array[object]，建议补充的工具调用；不需要补工具时输出 []
+- reason: string，证据评估理由
+
+suggested_next_tools 中每个对象必须包含：
+- tool_name: string
+- args: object
+- purpose: string
+- expected_evidence: array[string]
+
+## 正确输出样例
+
+{
+  "answerable": true,
+  "need_more_tools": false,
+  "missing_evidence": [],
+  "suggested_next_tools": [],
+  "reason": "risk_prediction、history_summary 和 maintenance_advice 已满足当前问题"
+}
+
 ## 输出
-只输出 EvidenceEvaluation JSON。"""
+只输出 EvidenceEvaluation JSON。不要输出 markdown、解释文字或节点状态包装对象。"""
+
+
+EVALUATE_OUTPUT_CONTRACT = """## 最终输出格式要求
+只输出一个合法 JSON object，不要 markdown，不要解释文字。
+JSON 根对象必须直接包含且只需要包含这些字段：
+answerable, need_more_tools, missing_evidence, suggested_next_tools, reason。
+不要增加任何外层包装字段，不要输出节点状态对象。
+字段类型必须符合 EvidenceEvaluation：answerable/need_more_tools 为 boolean；missing_evidence/suggested_next_tools 为 array；reason 为 string。
+"""
+
+
+EVALUATE_JSON_SKELETON = """{
+  "answerable": true,
+  "need_more_tools": false,
+  "missing_evidence": [],
+  "suggested_next_tools": [],
+  "reason": "当前证据已经足够回答用户问题"
+}"""
 
 
 def _rule_based_evaluate(state: AfcAgentState) -> dict[str, Any]:
@@ -178,9 +221,25 @@ def evaluate_evidence_node(state: AfcAgentState) -> dict[str, Any]:
             f"\n## 工具计划\n{json.dumps(tool_plan, ensure_ascii=False, indent=2)}\n"
             f"\n## 证据包\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2, default=str)}\n"
             f"\n## 工具循环次数\n{tool_loop_count}/{MAX_TOOL_LOOPS}\n"
-            f"\n请输出 EvidenceEvaluation JSON："
+            f"\n{EVALUATE_OUTPUT_CONTRACT}"
+            f"\n## JSON skeleton\n{EVALUATE_JSON_SKELETON}\n"
         )
-        result = call_llm_json(llm=llm, prompt=prompt, schema=EvidenceEvaluation, system_prompt=EVALUATE_SYSTEM)
+        repair_context = (
+            f"{prompt}\n\n"
+            "Repair reminder: output the EvidenceEvaluation root JSON object only. "
+            "The root fields must be answerable, need_more_tools, missing_evidence, "
+            "suggested_next_tools, and reason. Do not wrap the object in any state or node field. "
+            "Use this exact shape:\n"
+            f"{EVALUATE_JSON_SKELETON}"
+        )
+        result = call_llm_json(
+            llm=llm,
+            prompt=prompt,
+            schema=EvidenceEvaluation,
+            system_prompt=EVALUATE_SYSTEM,
+            max_repair_attempts=2,
+            repair_context=repair_context,
+        )
         evaluation = result.model_dump()
     except Exception as exc:
         errors.append(f"LLM 证据评估不可用: {str(exc)}")

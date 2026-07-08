@@ -16,8 +16,8 @@ import json
 from typing import Any
 
 from backend.agent.llm_json import call_llm_json
-from backend.agent.schemas import ToolPlan, route_to_task_type
-from backend.agent.state import AfcAgentState, NO_DEVICE_ROUTES, NO_TOOL_ROUTES
+from backend.agent.schemas import ToolPlan
+from backend.agent.state import AfcAgentState, NO_TOOL_ROUTES
 from backend.agent.tools import TOOL_BY_NAME
 from backend.core.llm import get_parse_llm
 
@@ -211,6 +211,7 @@ Field name rules:
 - NEVER use a field named "tool".
 - ALWAYS use "tool_name" for the tool name.
 - If repairing invalid JSON that used "tool", rename it to "tool_name" and add any missing required fields.
+- Do not wrap the result in any state or node field.
 """
 
 
@@ -241,7 +242,7 @@ For no-tool plans, use:
 """
 
 
-DEVICE_ADVICE_FEW_SHOT = """## Few-shot examples
+DEVICE_ADVICE_FEW_SHOT = """## Few-shot example
 Input:
 {
   "route": "business_device",
@@ -267,14 +268,6 @@ Correct ToolPlan output:
     "must_not_predict_exact_failure_date": true,
     "must_answer_with_risk_window": false
   }
-}
-
-Incorrect output, do not imitate:
-{
-  "tool_calls": [
-    {"tool": "get_maintenance_advice_tool", "args": {"assetnum": "1000029970"}}
-  ],
-  "answer_mode": "evidence_based"
 }
 """
 
@@ -316,7 +309,17 @@ PLAN_TOOLS_SYSTEM = """你是 AFC 智能运维 Agent 的工具规划器。
 
 {few_shot}
 
-只输出一个合法的 ToolPlan JSON 对象，不要输出 markdown 或解释文字。"""
+只输出一个合法的 ToolPlan JSON 对象，不要输出 markdown、解释文字或节点状态包装对象。"""
+
+
+TOOL_PLAN_FINAL_CONTRACT = """## 最终输出格式要求
+只输出一个合法 JSON object，不要 markdown，不要解释文字。
+JSON 根对象必须直接包含这些字段：
+tool_calls, use_existing_evidence, reason, answer_mode, answer_policy。
+tool_calls 中每个对象必须直接包含 tool_name, args, purpose, expected_evidence。
+不要增加任何外层包装字段，不要输出节点状态对象。
+字段名必须使用 tool_name，不要使用其他工具名称字段。
+"""
 
 
 def _build_plan_tools_prompt(query_understanding: dict[str, Any], evidence_packet: dict[str, Any]) -> str:
@@ -327,7 +330,8 @@ def _build_plan_tools_prompt(query_understanding: dict[str, Any], evidence_packe
         f"{DEVICE_ADVICE_FEW_SHOT}\n"
         f"## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
         f"\n## 已有证据\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2) if evidence_packet else '无'}\n"
-        "\n请输出完整 ToolPlan JSON。必须使用 tool_name 字段，禁止使用 tool 字段。"
+        f"\n{TOOL_PLAN_FINAL_CONTRACT}"
+        f"\n## JSON skeleton\n{TOOL_PLAN_JSON_SKELETON}\n"
     )
 
 
@@ -381,7 +385,7 @@ def plan_tools_node(state: AfcAgentState) -> dict[str, Any]:
             "Repair reminder: convert any tool_calls[].tool field to tool_calls[].tool_name. "
             "Every tool call must include tool_name, args, purpose, expected_evidence. "
             "The root object must include tool_calls, use_existing_evidence, reason, answer_mode, answer_policy. "
-            "Do not return the short schema {tool_calls:[{tool,args}],answer_mode}. "
+            "Do not wrap the object in any state or node field. "
             "Use this exact shape:\n"
             f"{TOOL_PLAN_JSON_SKELETON}"
         )
