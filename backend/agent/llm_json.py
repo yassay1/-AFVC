@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -23,6 +24,58 @@ from pydantic import BaseModel
 from backend.core.llm import get_parse_llm
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_text(value: Any, limit: int = 4000) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
+
+
+@dataclass
+class LLMJsonAttempt:
+    stage: str
+    error: str | None = None
+    raw_output: str | None = None
+    extracted_json: dict[str, Any] | None = None
+
+
+class LLMJsonError(ValueError):
+    """Structured LLM JSON failure with parse, validation, and repair details."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        schema_name: str,
+        attempts: list[LLMJsonAttempt] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.schema_name = schema_name
+        self.attempts = attempts or []
+
+    @property
+    def final_stage(self) -> str:
+        for attempt in reversed(self.attempts):
+            if attempt.error:
+                return attempt.stage
+        return "unknown"
+
+    def to_log_message(self, *, include_raw: bool = True, raw_limit: int = 4000) -> str:
+        lines = [f"schema={self.schema_name}", f"stage={self.final_stage}", f"error={str(self)}"]
+        for index, attempt in enumerate(self.attempts, start=1):
+            lines.append(f"attempt={index} stage={attempt.stage}")
+            if attempt.error:
+                lines.append(f"attempt={index} error={attempt.error}")
+            if attempt.extracted_json is not None:
+                lines.append(
+                    f"attempt={index} extracted_json="
+                    f"{json.dumps(attempt.extracted_json, ensure_ascii=False, default=str)}"
+                )
+            if include_raw and attempt.raw_output is not None:
+                lines.append(f"attempt={index} raw_output={_truncate_text(attempt.raw_output, raw_limit)}")
+        return "\n".join(lines)
 
 
 # ── JSON 提取 ─────────────────────────────────────────────────────
@@ -166,13 +219,61 @@ def repair_json_output(
         "确保所有必填字段都有值，类型正确，枚举值在合法范围内。"
     )
 
+    return _repair_json_output_with_trace(
+        raw_output=raw_output,
+        error_message=error_message,
+        target_schema=target_schema,
+        llm=llm,
+        repair_context=repair_context,
+    )[1]
+
+
+def _repair_json_output_with_trace(
+    raw_output: str,
+    error_message: str,
+    target_schema: type[BaseModel],
+    llm=None,
+    repair_context: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Repair JSON output and return both raw repair text and extracted JSON."""
+    if llm is None:
+        llm = get_parse_llm()
+
+    schema_fields: list[str] = []
+    if hasattr(target_schema, "model_fields"):
+        for field_name, field_info in target_schema.model_fields.items():
+            annotation = str(field_info.annotation).replace("typing.", "").replace("Optional", "optional")
+            description = getattr(field_info, "description", "")
+            schema_fields.append(f"  - {field_name}: {annotation} — {description}")
+    schema_desc = "\n".join(schema_fields) if schema_fields else str(target_schema)
+
+    repair_prompt = (
+        "你是一个 JSON 修复助手。下面是一段 LLM 输出，它本应符合目标 Schema，"
+        "但 JSON 解析或 Pydantic 校验失败了。\n\n"
+        "## 原始 LLM 输出\n"
+        f"{raw_output}\n\n"
+        + (f"## 原始任务上下文\n{repair_context}\n\n" if repair_context else "")
+        +
+        "## 错误信息\n"
+        f"{error_message}\n\n"
+        "## 目标 Schema\n"
+        f"类名: {target_schema.__name__}\n"
+        f"字段:\n{schema_desc}\n\n"
+        "## 要求\n"
+        "请只输出一个修复后的、合法的、完整的 JSON 对象。"
+        "不要添加任何解释、markdown 标记或多余文本。"
+        "输出对象必须直接符合目标 Schema 的根对象字段，不要增加外层包装字段。"
+        "确保所有必填字段都有值，类型正确，枚举值在合法范围内。"
+    )
+
     try:
         response = llm.invoke([
             SystemMessage(content="你是一个 JSON 修复助手。只输出修复后的 JSON 对象。"),
             HumanMessage(content=repair_prompt),
         ])
         content = response.content if hasattr(response, "content") else str(response)
-        return extract_json_from_text(str(content))
+        repair_raw_output = str(content)
+        return repair_raw_output, extract_json_from_text(repair_raw_output)
     except Exception as exc:
         raise ValueError(f"JSON 修复也失败了: {str(exc)}") from exc
 
@@ -210,6 +311,7 @@ def call_llm_json(
         ValueError: 所有尝试失败后抛出。
     """
     t_start = time.time()
+    attempts: list[LLMJsonAttempt] = []
 
     try:
         response = llm.invoke([
@@ -217,44 +319,53 @@ def call_llm_json(
             HumanMessage(content=prompt),
         ])
         raw_output = response.content if hasattr(response, "content") else str(response)
+        raw_output = str(raw_output)
     except Exception as exc:
-        raise ValueError(f"LLM 调用失败: {str(exc)}") from exc
+        raise LLMJsonError(
+            f"LLM 调用失败: {str(exc)}",
+            schema_name=schema.__name__,
+            attempts=[LLMJsonAttempt(stage="llm_call", error=str(exc))],
+        ) from exc
 
     logger.debug("LLM 调用耗时 %.2fs，输出长度 %d 字符", time.time() - t_start, len(raw_output))
 
-    # 尝试 1：直接提取 + 校验
-    errors: list[str] = []
+    first_attempt = LLMJsonAttempt(stage="initial_parse", raw_output=raw_output)
     try:
         data = extract_json_from_text(raw_output)
+        first_attempt.extracted_json = data
         result = parse_json_with_schema(data, schema)
         logger.debug("一次解析成功（schema=%s）", schema.__name__)
         return result
     except ValueError as exc:
-        errors.append(f"首次解析失败: {str(exc)}")
+        first_attempt.error = str(exc)
+        attempts.append(first_attempt)
         logger.debug("首次解析失败，尝试修复（schema=%s）", schema.__name__)
 
-    # 尝试 2：修复
-    for attempt in range(max_repair_attempts):
+    for attempt_index in range(max_repair_attempts):
+        stage = f"repair_{attempt_index + 1}"
+        repair_attempt = LLMJsonAttempt(stage=stage)
         try:
-            repaired_data = repair_json_output(
+            repair_raw_output, repaired_data = _repair_json_output_with_trace(
                 raw_output=raw_output,
-                error_message=errors[-1],
+                error_message=attempts[-1].error or "initial parse failed",
                 target_schema=schema,
                 llm=llm,
                 repair_context=repair_context or prompt,
             )
+            repair_attempt.raw_output = repair_raw_output
+            repair_attempt.extracted_json = repaired_data
             result = parse_json_with_schema(repaired_data, schema)
-            logger.debug("修复第 %d 次成功（schema=%s）", attempt + 1, schema.__name__)
+            logger.debug("修复第 %d 次成功（schema=%s）", attempt_index + 1, schema.__name__)
             return result
         except ValueError as exc:
-            errors.append(f"修复第 {attempt + 1} 次失败: {str(exc)}")
-            logger.warning("修复第 %d 次失败（schema=%s）", attempt + 1, schema.__name__)
+            repair_attempt.error = str(exc)
+            attempts.append(repair_attempt)
+            logger.warning("修复第 %d 次失败（schema=%s）", attempt_index + 1, schema.__name__)
 
-    # 全部失败
-    detailed_errors = "\n".join(errors)
-    raise ValueError(
-        f"LLM JSON 解析和 {max_repair_attempts} 次修复全部失败。\n"
-        f"目标 Schema: {schema.__name__}\n"
-        f"原始输出（前 500 字符）: {raw_output[:500]}\n"
-        f"错误详情:\n{detailed_errors}"
+    error = LLMJsonError(
+        f"LLM JSON 解析和 {max_repair_attempts} 次修复全部失败。",
+        schema_name=schema.__name__,
+        attempts=attempts,
     )
+    logger.error("LLM JSON failed\n%s", error.to_log_message(include_raw=True, raw_limit=8000))
+    raise error

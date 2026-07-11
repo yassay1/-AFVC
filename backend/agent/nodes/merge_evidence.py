@@ -59,6 +59,7 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
         "warning": None,
         "maintenance_advice": None,
         "manual_evidence": None,
+        "fault_prediction": None,
         "data_overview": None,
         "high_risk_devices": None,
         "sources": [t.get("tool") for t in tool_trace if t.get("status") == "success"],
@@ -84,6 +85,7 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
             "warning_reason": risk.get("warning_reason"),
         }
         evidence_packet["maintenance_advice"] = integrated.get("maintenance_advice", {})
+        evidence_packet["fault_prediction"] = integrated.get("fault_prediction")
 
     # ── 从 predict_device_risk_tool 提取 ──
     risk = tool_results.get("predict_device_risk_tool", {})
@@ -119,6 +121,12 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
                 "brand": advice.get("brand"),
                 "subsystem": advice.get("subsystem"),
             }
+
+    # ── 从 predict_device_fault_type_tool 提取 ──
+    fault_type = tool_results.get("predict_device_fault_type_tool", {})
+    if isinstance(fault_type, dict) and fault_type.get("status") in ("success", "unavailable"):
+        if not evidence_packet["fault_prediction"]:
+            evidence_packet["fault_prediction"] = fault_type
 
     # ── 从 search_maintenance_manual_tool 提取 ──
     manual = tool_results.get("search_maintenance_manual_tool", {})
@@ -170,6 +178,9 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
 
         if business_goal == "high_risk_ranking" and not evidence_packet["high_risk_devices"]:
             missing.append("high_risk_devices")
+
+        if business_goal == "fault_type_prediction" and not evidence_packet["fault_prediction"]:
+            missing.append("fault_prediction")
 
         evidence_packet["missing_evidence"] = missing
 

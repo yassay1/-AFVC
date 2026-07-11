@@ -1,4 +1,4 @@
-"""LangChain Tools 工具层 —— 把 Service 层封装成 Agent 可调用的工具。
+"""LangChain Tools 工具层：把 Service 层封装成 Agent 可调用的工具。
 
 每个工具只做薄封装，业务逻辑全在 Service 层。
 """
@@ -14,6 +14,7 @@ from backend.services.warning_service import generate_warning_info as _generate_
 from backend.services.advice_service import generate_device_advice as _generate_device_advice
 from backend.services.analysis_service import generate_device_analysis as _generate_device_analysis
 from backend.services.rag_service import search_manual as _search_manual
+from backend.services.fault_prediction_service import predict_device_fault_type as _predict_device_fault_type
 
 
 @tool
@@ -117,10 +118,10 @@ def get_warning_level_tool(risk_30d: float, risk_90d: float) -> dict:
     """根据 30 天和 90 天风险值生成红橙黄绿预警等级。
 
     预警规则：
-    - 红色预警：risk_30d ≥ 0.75 或 risk_90d ≥ 0.90 → 建议 3～7 天内巡检
-    - 橙色预警：risk_30d ≥ 0.55 或 risk_90d ≥ 0.75 → 建议 7～14 天内巡检
-    - 黄色预警：risk_30d ≥ 0.35 或 risk_90d ≥ 0.55 → 建议 14～30 天内关注
-    - 绿色关注：其他 → 常规周期巡检
+    - 红色预警：risk_30d >= 0.75 或 risk_90d >= 0.90，建议 3～7 天内巡检
+    - 橙色预警：risk_30d >= 0.55 或 risk_90d >= 0.75，建议 7～14 天内巡检
+    - 黄色预警：risk_30d >= 0.35 或 risk_90d >= 0.55，建议 14～30 天内关注
+    - 绿色关注：其他，常规周期巡检
 
     适用场景：
     - 用户问“为什么设备 XXX 是红色预警”
@@ -230,6 +231,50 @@ def get_high_risk_devices_tool(top_n: int = 10) -> dict:
 
 
 @tool
+def predict_device_fault_type_tool(
+    assetnum: str,
+    window_days: int = 30,
+    top_k: int = 3,
+) -> dict:
+    """预测指定 AFC 设备在未来时间窗口内最可能出现的故障类别。
+
+    返回整体故障风险、各故障类别的条件概率，以及综合估计发生概率。
+    该工具用于回答“最可能发生什么故障”“下一次可能坏在哪里”等问题。
+
+    概率含义：
+    - overall_failure_risk：预测窗口内发生故障工单的总体风险
+    - conditional_probability：若发生故障，属于某一类别的条件概率
+    - estimated_occurrence_probability：总体风险与条件概率的组合估计
+
+    注意：故障类型概率表示相对可能性，不代表故障一定发生。
+
+    适用场景：
+    - 用户问“设备 XXX 最可能发生什么故障”
+    - 用户问“未来 30 天可能出现什么错误”
+    - 用户问“下一次可能坏在哪里”
+    - 用户问“最可能出问题的是哪个模块”
+    - 用户问“会发生什么故障”
+
+    Args:
+        assetnum: 设备编号。
+        window_days: 预测时间窗口（天），默认 30。
+        top_k: 返回的故障类别数量，默认 3。
+    """
+    try:
+        return _predict_device_fault_type(
+            assetnum=assetnum.strip(),
+            window_days=window_days,
+            top_k=top_k,
+        )
+    except FileNotFoundError as e:
+        return {"status": "error", "message": str(e)}
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        return {"status": "error", "message": f"故障类型预测失败：{str(e)}"}
+
+
+@tool
 def search_maintenance_manual_tool(
     query: str,
     assetnum: str | None = None,
@@ -244,9 +289,9 @@ def search_maintenance_manual_tool(
 
     适用场景：
     - 用户明确要求按维修手册/规程/标准流程回答
-    - advice_query 需要维修手册依据增强时
+    - device_advice 需要维修手册依据增强时
     - full_diagnosis 需要维修建议时
-    - 用户问"按手册应该先查哪里"
+    - 用户问“按手册应该先查哪里”
 
     Args:
         query: 检索查询文本（通常是用户问题或故障现象）。
@@ -267,8 +312,6 @@ def search_maintenance_manual_tool(
         return {"status": "error", "message": f"维修手册检索失败：{str(e)}"}
 
 
-# ── 工具注册表 ──────────────────────────────────────────────
-
 ALL_TOOLS = [
     get_data_summary_tool,
     list_devices_tool,
@@ -279,6 +322,7 @@ ALL_TOOLS = [
     get_integrated_analysis_tool,
     get_high_risk_devices_tool,
     search_maintenance_manual_tool,
+    predict_device_fault_type_tool,
 ]
 
 TOOL_BY_NAME = {tool.name: tool for tool in ALL_TOOLS}

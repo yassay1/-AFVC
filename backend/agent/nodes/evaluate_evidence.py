@@ -13,15 +13,17 @@ v0.3.0 升级：
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
-from backend.agent.llm_json import call_llm_json
+from backend.agent.llm_json import LLMJsonError, call_llm_json
 from backend.agent.schemas import EvidenceEvaluation
 from backend.agent.state import AfcAgentState
 from backend.core.llm import get_parse_llm
 
 # 最大工具补充轮次
 MAX_TOOL_LOOPS = 2
+logger = logging.getLogger(__name__)
 
 # 不需要业务证据的 answer_mode
 _NO_EVIDENCE_MODES = {"direct_chat", "capability_intro", "ask_for_assetnum", "unsupported"}
@@ -44,11 +46,12 @@ EVALUATE_SYSTEM = """你是 AFC 智能运维 Agent 的证据评估器。
 4. 用户问维修建议，但没有 maintenance_advice → answerable=false, 需要 get_maintenance_advice_tool
 5. 用户问数据概览，但没有 data_overview → answerable=false, 需要 get_data_summary_tool
 6. 用户问高风险设备，但没有 high_risk_devices → answerable=false, 需要 get_high_risk_devices_tool
-7. 用户问完整诊断（full_diagnosis）但缺历史/风险/建议中任意一项 → answerable=false
+7. 用户问故障类型预测（fault_type_prediction），但没有 fault_prediction → answerable=false, 需要 predict_device_fault_type_tool
+8. 用户问完整诊断（full_diagnosis）但缺历史/风险/建议中任意一项 → answerable=false
 
-8. 如果 tool_errors 中有 missing_required_argument 类型的错误 → 不要建议补充工具
+9. 如果 tool_errors 中有 missing_required_argument 类型的错误 → 不要建议补充工具
    （缺少设备编号，再补工具也没用）
-9. 如果所有工具都失败了且没有有效证据 → answerable=false, need_more_tools=false
+10. 如果所有工具都失败了且没有有效证据 → answerable=false, need_more_tools=false
    （不要无限循环）
 
 ## EvidenceEvaluation JSON Schema
@@ -163,6 +166,13 @@ def _rule_based_evaluate(state: AfcAgentState) -> dict[str, Any]:
                 "purpose": "补充维修手册证据",
                 "expected_evidence": ["manual_steps", "manual_cause"],
             })
+        elif m == "fault_prediction":
+            suggested.append({
+                "tool_name": "predict_device_fault_type_tool",
+                "args": {"assetnum": assetnum, "window_days": 30, "top_k": 3} if assetnum else {},
+                "purpose": "补充故障类型预测证据",
+                "expected_evidence": ["most_likely_fault", "fault_type_predictions"],
+            })
 
     # 如果所有工具都失败了
     if not evidence_packet.get("sources") and tool_errors:
@@ -215,34 +225,60 @@ def evaluate_evidence_node(state: AfcAgentState) -> dict[str, Any]:
     evaluation: dict[str, Any] | None = None
     try:
         llm = get_parse_llm()
-        prompt = (
-            f"## 用户问题\n{state.get('query', '')}\n"
-            f"\n## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
-            f"\n## 工具计划\n{json.dumps(tool_plan, ensure_ascii=False, indent=2)}\n"
-            f"\n## 证据包\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2, default=str)}\n"
-            f"\n## 工具循环次数\n{tool_loop_count}/{MAX_TOOL_LOOPS}\n"
-            f"\n{EVALUATE_OUTPUT_CONTRACT}"
-            f"\n## JSON skeleton\n{EVALUATE_JSON_SKELETON}\n"
-        )
-        repair_context = (
-            f"{prompt}\n\n"
-            "Repair reminder: output the EvidenceEvaluation root JSON object only. "
-            "The root fields must be answerable, need_more_tools, missing_evidence, "
-            "suggested_next_tools, and reason. Do not wrap the object in any state or node field. "
-            "Use this exact shape:\n"
-            f"{EVALUATE_JSON_SKELETON}"
-        )
-        result = call_llm_json(
-            llm=llm,
-            prompt=prompt,
-            schema=EvidenceEvaluation,
-            system_prompt=EVALUATE_SYSTEM,
-            max_repair_attempts=2,
-            repair_context=repair_context,
-        )
-        evaluation = result.model_dump()
     except Exception as exc:
-        errors.append(f"LLM 证据评估不可用: {str(exc)}")
+        error_message = (
+            "evaluate_evidence LLM failed "
+            "schema=EvidenceEvaluation stage=llm_init "
+            f"error={str(exc)}"
+        )
+        logger.exception(error_message)
+        errors.append(error_message)
+    else:
+        try:
+            prompt = (
+                f"## 用户问题\n{state.get('query', '')}\n"
+                f"\n## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
+                f"\n## 工具计划\n{json.dumps(tool_plan, ensure_ascii=False, indent=2)}\n"
+                f"\n## 证据包\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2, default=str)}\n"
+                f"\n## 工具循环次数\n{tool_loop_count}/{MAX_TOOL_LOOPS}\n"
+                f"\n{EVALUATE_OUTPUT_CONTRACT}"
+                f"\n## JSON skeleton\n{EVALUATE_JSON_SKELETON}\n"
+            )
+            repair_context = (
+                f"{prompt}\n\n"
+                "Repair reminder: output the EvidenceEvaluation root JSON object only. "
+                "The root fields must be answerable, need_more_tools, missing_evidence, "
+                "suggested_next_tools, and reason. Do not wrap the object in any state or node field. "
+                "Use this exact shape:\n"
+                f"{EVALUATE_JSON_SKELETON}"
+            )
+            result = call_llm_json(
+                llm=llm,
+                prompt=prompt,
+                schema=EvidenceEvaluation,
+                system_prompt=EVALUATE_SYSTEM,
+                max_repair_attempts=2,
+                repair_context=repair_context,
+            )
+            evaluation = result.model_dump()
+        except LLMJsonError as exc:
+            logger.error(
+                "evaluate_evidence LLM failed\n%s",
+                exc.to_log_message(include_raw=True, raw_limit=8000),
+            )
+            errors.append(
+                "evaluate_evidence LLM failed "
+                f"schema=EvidenceEvaluation stage={exc.final_stage} "
+                f"error={str(exc)}"
+            )
+        except Exception as exc:
+            error_message = (
+                "evaluate_evidence LLM failed "
+                "schema=EvidenceEvaluation stage=unknown "
+                f"error={str(exc)}"
+            )
+            logger.exception(error_message)
+            errors.append(error_message)
 
     if evaluation is None:
         evaluation = _rule_based_evaluate(state)

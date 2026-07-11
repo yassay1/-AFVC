@@ -31,7 +31,6 @@ class DiagnoseResponse(BaseModel):
     query: str
     intent: dict = Field(default_factory=dict)
     assetnum: str | None = None
-    task_type: str | None = None
     time_window: str | None = None
     requires_asset: bool | None = None
     is_global: bool | None = None
@@ -44,7 +43,8 @@ class DiagnoseResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
     session_id: str | None = None
     last_assetnum: str | None = None
-    last_task_type: str | None = None
+    last_route: str | None = None
+    last_business_goal: str | None = None
     # v0.3.0 新增字段
     context_packet: dict = Field(default_factory=dict, description="上下文包")
     query_understanding: dict = Field(default_factory=dict, description="问题理解结果")

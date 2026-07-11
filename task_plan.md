@@ -1,119 +1,101 @@
-# 任务计划：AFC 故障复发风险预测与智能维修建议系统
+# 任务计划：AFC Agent 全项目文本完整性治理
 
 ## 目标
-完成 AFC RiskOps Agent System 的剩余工作，使其达到可演示、可部署的完整状态。
+清理 AFC Agent 项目中的中文乱码、替换字符、私用区字符、错误编码文本和不可读文案，统一文本文件为 UTF-8，并建立自动检查机制，防止乱码再次进入项目。
 
-## 当前阶段
-阶段 2：待用户选择下一步方向
+## 修改边界
+- 只处理 docstring、注释、Prompt、工具描述、日志、错误消息、API 文案、前端文案、测试文本和文档。
+- 不修改 Agent 流程、路由逻辑、证据评估逻辑、业务算法、工具名称和参数、API 数据结构、数据处理规则、风险预测结果、前端业务交互流程。
+- 不进行无差别批量转码；能从 Git 历史恢复的优先恢复，无法恢复的按代码语义重写。
 
-## 项目当前状态总览
+## 阶段计划
 
-| 维度 | 状态 | 详情 |
+### 阶段 1：建立基线和扫描
+- [x] 记录当前 Git 状态。
+- [x] 运行 `python -m compileall -f backend frontend tests`。
+- [x] 运行 `pytest`。
+- [x] 扫描 `backend`、`frontend`、`tests`、`docs`、`README.md` 和根目录记录文件。
+- [x] 检查 UTF-8 strict 解码。
+- [x] 搜索替换字符、私用区字符和常见乱码片段。
+- 状态：complete
+
+### 阶段 2：修复 Agent 核心文本
+- [x] 修复 `backend/agent/tools.py` 工具描述、docstring、错误消息和注释。
+- [x] 保留新增故障类型预测工具，不改工具参数、服务调用和返回结构。
+- [x] 验证核心工具文案无乱码。
+- 状态：complete
+
+### 阶段 3：修复用户可见文本
+- [x] 检查 `backend/api/`。
+- [x] 检查 `frontend/streamlit_app.py`。
+- [x] 确认 API message、错误提示、调试字段说明和前端文本无乱码。
+- 状态：complete
+
+### 阶段 4：修复维护性文本
+- [x] 检查 `backend/services/`、`tests/`、`docs/`、`README.md`。
+- [x] 从 Git 历史恢复 `task_plan.md`、`findings.md`、`progress.md` 的可读内容，并改写为本次治理记录。
+- [x] 验证维护性文本无乱码。
+- 状态：complete
+
+### 阶段 5：建立预防机制
+- [x] 新增 `scripts/check_text_integrity.py`。
+- [x] 新增 `.editorconfig` 并设置 UTF-8。
+- [x] 检查文本文件读写是否显式使用 `encoding="utf-8"`。
+- [x] 增加工具描述和核心文案无乱码测试。
+- [x] 将文本完整性检查加入测试流程。
+- 状态：complete
+
+### 阶段 6：全面验证
+- [x] 运行 `python scripts/check_text_integrity.py`。
+- [x] 运行 `python -m compileall -f backend frontend tests`。
+- [x] 运行 `pytest`。
+- [x] 执行 Agent 冒烟测试：能力介绍、历史查询、风险查询、维修建议、高风险排行、缺少设备编号追问、API 错误提示、前端调试信息。
+- 状态：complete
+
+## 初始扫描结果
+- 当前 Git 状态：工作区已有较多未提交修改、删除和新增文件；本次治理不回滚已有用户改动。
+- 基线编译：`python -m compileall -f backend frontend tests` 通过。
+- 基线测试：`pytest` 收集 184 个用例，184 passed。
+- 目标文本文件 UTF-8 strict 解码：74 个目标文本文件全部可解码，非 UTF-8 文件 0 个。
+- 固化乱码集中位置：
+  - `backend/agent/tools.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 扫描误报：
+  - `backend/agent/llm_json.py` 的 Markdown 代码块正则。
+  - `backend/agent/nodes/understand_query.py` 的中文正则 unicode escape。
+  - `backend/agent/report_builder.py` 的正常中文示例问题。
+
+## 问题分类
+| 分类 | 文件 | 处理 |
 |------|------|------|
-| 后端 API (7个路由) | ✅ 完成 | FastAPI + Uvicorn，全部可用 |
-| 业务服务层 (7个服务) | ✅ 完成 | 数据/设备/预测/预警/建议/分析/模型适配 |
-| Agent 编排 (LangGraph) | ✅ 完成 | 6节点工作流 + 8个LangChain工具 |
-| 多轮对话 | ✅ 完成 | InMemorySaver checkpointer + 指代补全 |
-| 前端 (Streamlit) | ✅ 完成 | 6页面完整前端 |
-| 测试 (93个用例) | ✅ 全部通过 | Service/Tools/Graph 三层覆盖 |
-| 文档整理 | ✅ 完成 | 3份重叠文档→2份精简文档，移入docs/ |
-| 数据清理 | ✅ 完成 | 重复文件删除，预测CSV扩展到240设备 |
-| 代码质量 | ✅ 完成 | 版本号修正、LLM缓存、日志、前端优化 |
-| 预测模型 | ⚠️ Mock | 规则兜底，待接入真实ML模型 |
-| RAG 知识库 | ⚠️ 预留 | 接口已留，维修手册向量检索未接入 |
-| 数据存储 | ⚠️ 文件系统 | 未迁移到 PostgreSQL/MySQL |
-| 部署 | ⚠️ 本地 | 未容器化 |
-| 前端框架 | ⚠️ Streamlit | 未升级到 React/Vue |
+| 非 UTF-8 文件 | 无 | 无需转码 |
+| UTF-8 文件中的固化乱码 | `backend/agent/tools.py`、`task_plan.md`、`findings.md`、`progress.md` | 修复 |
+| 不可逆替换字符 | 暂未发现 U+FFFD | 无 |
+| 私用区字符 | `backend/agent/tools.py`、根目录三份记录文件 | 修复 |
+| 可疑但需人工判断 | 无新增残留 | 持续扫描 |
+| 扫描误报 | `llm_json.py`、`understand_query.py`、`report_builder.py` | 加入脚本排除/降噪规则 |
 
-## 各阶段
+## 阶段验证记录
+| 阶段 | 编译 | 测试 | 文本扫描 |
+|------|------|------|------|
+| 阶段 1 | 通过 | 184 passed | 初始命中 4 个真实问题文件 |
+| 阶段 2 | 通过 | 184 passed | `backend/agent/tools.py` 命中 0 |
+| 阶段 3 | 通过 | 184 passed | `backend/api/`、`frontend/` 命中 0 |
+| 阶段 4 | 通过 | 184 passed | 维护性文本命中 0 |
+| 阶段 5 | 通过 | 186 passed | `check_text_integrity.py` 通过 |
+| 阶段 6 | 通过 | 186 passed | 最终扫描通过 |
 
-### 阶段 1：需求评估与方向确定
-- [x] 全面评估项目代码和架构
-- [x] 运行全部测试确认基线状态 (93/93 passed)
-- [x] 与用户确定优先完成的方向（文档+代码质量）
-- **状态：** complete
+## 修改记录
+- `backend/agent/tools.py`：从 Git 历史恢复原有可读文案；按新增工具语义重写 `predict_device_fault_type_tool` 的 docstring 和错误消息。
+- `task_plan.md`：恢复为可读 UTF-8 文档并记录本次治理计划和结果。
+- `findings.md`：恢复为可读 UTF-8 文档并记录扫描发现。
+- `progress.md`：恢复为可读 UTF-8 文档并记录执行日志。
+- `scripts/check_text_integrity.py`：新增文本完整性检查脚本。
+- `.editorconfig`：新增 UTF-8 编辑器配置。
+- `tests/test_text_integrity.py`：新增默认 pytest 文本完整性守护测试。
 
-### 阶段 2：文档整理与代码质量修复
-- [x] 整合精简三个重叠设计文档 → docs/architecture.md + docs/project-brief.md
-- [x] 处理 requirements.txt 编码问题（UTF-8 标准化）
-- [x] 清理 raw 目录重复文件
-- [x] 生成有意义的 prediction_results.csv（3条→240条真实设备）
-- [x] 整理 docs 目录 + 更新 README 引用
-- [x] 修复版本号 (config.py: 0.2.0→0.2.1)
-- [x] 添加 LLM 实例懒加载缓存
-- [x] 添加日志模块
-- [x] 前端版本号动态读取后端
-- [x] 清理前端未使用变量
-- [x] 93/93 测试通过
-- **状态：** complete
-
-### 阶段 3：修复 Agent 诊断工作台三个异常
-- [x] Bug 1：能力询问("你会干什么")返回空设备报告 → 新增 capability_query 任务类型
-- [x] Bug 2：数据概览问题返回设备诊断格式 → generate_report_node 按 task_type 分支
-- [x] Bug 3：多轮对话错误残留 → parse_question_node 重置 errors
-- [x] 93/93 测试通过
-- **状态：** complete
-
-### 阶段 4：待定（根据用户选择）
-- **状态：** pending
-
-### 阶段 4：测试与验证
-- **状态：** pending
-
-### 阶段 5：交付
-- **状态：** pending
-
-## 关键问题
-1. 用户希望优先完成哪个方向？（预测模型接入 / RAG / 部署 / 前端升级 / 其他）
-2. 是否有真实的 ML 模型可以接入？
-3. 面试演示的时间节点是什么？
-
-## 已做决策
-| 决策 | 理由 |
-|------|------|
-| 3份设计文档整合为2份 | 消除重叠，按"架构"和"项目说明"分类 |
-| LLM 实例采用懒加载单例 | 避免每次调用重新创建 ChatOpenAI 连接 |
-| prediction_results.csv 扩展到240设备 | 覆盖更多真实设备，使外部模型模式更可用 |
-
-## 遇到的错误
-| 错误 | 尝试次数 | 解决方案 |
-|------|---------|---------|
-| Explore Agent 模型适配失败 | 1 | 直接使用文件搜索和阅读工具完成代码审查 |
-| 正则过宽导致测试失败 | 1 | 移除过宽的"分析"匹配模式，恢复原有多词精确匹配 |
-
-## 修改的文件清单
-- `backend/core/config.py` — 版本号 0.2.0→0.2.1
-- `backend/core/llm.py` — 添加 LLM 实例懒加载缓存 + logging
-- `backend/main.py` — 添加 logging 模块 + 启动/关闭日志
-- `backend/agent/nodes.py` — 设备切换正则还原（避免误匹配）
-- `frontend/streamlit_app.py` — 版本号动态读取 + 清理未使用变量
-- `docs/architecture.md` — 新建：整合架构设计文档
-- `docs/project-brief.md` — 新建：整合项目说明文档
-- `backend/data/mock/prediction_results.csv` — 扩展到240设备
-- `requirements.txt` — UTF-8 编码标准化
-- `README.md` — 更新文档引用
-- 删除：3个原始重叠文档 + 1个重复数据文件
-
-## 备注
-- 93个测试全部通过，代码基线健康
-- .env 已配置智谱 GLM-4-Flash 模型，.gitignore 已排除 .env
-- 如要启动验证，运行 `uvicorn backend.main:app` + `streamlit run frontend/streamlit_app.py`
-
-## 2026-07-03 新增阶段：三节点混合型诊断 Agent 重构
-
-### 阶段 4：架构重构
-- [x] 全面阅读 `backend/agent`、`backend/services`、`backend/api`、`frontend`、`tests`
-- [x] 输出架构诊断：旧实现为固定 6 节点流水线，工具选择过度依赖 `TASK_TOOL_MAP`
-- [x] 将图重构为 `parse_intent -> reason_act -> generate_report`
-- [x] `parse_intent` 支持规则优先、LLM structured output、多轮指代、设备切换、全局问题和能力询问
-- [x] `reason_act` 支持工具白名单、设备校验、tool-calling 主路径、规则兜底、`tool_trace` 和标准化 evidence
-- [x] `generate_report` 支持按场景生成报告和模板兜底
-- [x] 每轮入口清空 `errors/selected_tools/tool_results/tool_trace/evidence/final_answer`
-- [x] 保持 service 层业务逻辑不重写，API 和前端字段向后兼容
-- 状态：complete
-
-### 阶段 5：验收测试
-- [x] 覆盖能力询问、数据概览、高风险设备、单设备诊断、风险查询、维修建议、风险+建议组合、多轮指代、设备切换、设备编号缺失、设备不存在、session 隔离、LLM 不可用规则兜底
-- [x] `python -m pytest tests/test_agent_graph.py -q`：65 passed
-- [x] `python -m pytest -q`：106 passed
-- 状态：complete
+## 剩余问题
+- 未发现残留乱码。
+- 当前 PowerShell 控制台可能把正常 UTF-8 中文显示成乱码；最终判断以 Python strict 解码和脚本检查为准。

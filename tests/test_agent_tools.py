@@ -33,8 +33,8 @@ UNKNOWN_ASSETNUM = "ZZZ99999"
 class TestToolRegistry:
 
     def test_all_tools_registered(self):
-        """应有 9 个工具（8 个业务工具 + 1 个 RAG 手册检索工具）。"""
-        assert len(ALL_TOOLS) == 9
+        """应有 10 个工具（9 个业务工具 + 1 个 RAG 手册检索工具）。"""
+        assert len(ALL_TOOLS) == 10
 
     def test_tool_by_name_matches(self):
         """TOOL_BY_NAME 应与 ALL_TOOLS 一致。"""

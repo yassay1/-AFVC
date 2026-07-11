@@ -105,7 +105,7 @@ def _new_turn_state(query: str) -> dict:
     }
 
 
-def _compat_evidence_from_packet(evidence_packet: dict) -> dict:
+def _api_evidence_from_packet(evidence_packet: dict) -> dict:
     """将 v0.3 evidence_packet 转成旧 API evidence 形状。"""
     return {
         "assetnum": evidence_packet.get("assetnum"),
@@ -121,7 +121,7 @@ def _compat_evidence_from_packet(evidence_packet: dict) -> dict:
     }
 
 
-def _compat_selected_tools(final_state: dict) -> list[str]:
+def _api_selected_tools(final_state: dict) -> list[str]:
     """从 v0.3 tool_trace/tool_plan 回填旧 API selected_tools。"""
     selected_tools: list[str] = []
     for trace in final_state.get("tool_trace", []):
@@ -137,12 +137,14 @@ def _compat_selected_tools(final_state: dict) -> list[str]:
     return selected_tools
 
 
-def _compat_asset_exists(query_understanding: dict, evidence_packet: dict, tool_trace: list[dict]) -> bool | None:
+def _api_asset_exists(query_understanding: dict, evidence_packet: dict, tool_trace: list[dict]) -> bool | None:
     """根据 v0.3.0 状态估算旧 API asset_exists。"""
     route = query_understanding.get("route", "")
     # 非设备路由 → 不需要 assetnum
     if route in {"direct_chat", "capability_query", "business_global", "unsupported"}:
         return True
+    if route == "needs_clarification":
+        return False
     if query_understanding.get("needs_asset") and not query_understanding.get("assetnum"):
         return False
     if evidence_packet.get("assetnum") and evidence_packet.get("sources"):
@@ -172,7 +174,6 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
             "status": "error",
             "query": query,
             "assetnum": None,
-            "task_type": None,
             "time_window": None,
             "selected_tools": [],
             "tool_results": {},
@@ -181,15 +182,16 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
             "final_answer": f"Agent 工作流执行异常：{str(exc)}",
             "errors": [str(exc)],
             "session_id": session_id,
+            "route": None,
+            "business_goal": None,
         }
 
     query_understanding = final_state.get("query_understanding", {})
     evidence_packet = final_state.get("evidence_packet", {})
     tool_trace = final_state.get("tool_trace", [])
     tool_plan = final_state.get("tool_plan", {})
-    selected_tools = _compat_selected_tools(final_state)
-    asset_exists = _compat_asset_exists(query_understanding, evidence_packet, tool_trace)
-    task_type = query_understanding.get("task_type")
+    selected_tools = _api_selected_tools(final_state)
+    asset_exists = _api_asset_exists(query_understanding, evidence_packet, tool_trace)
     assetnum = query_understanding.get("assetnum") or evidence_packet.get("assetnum")
     route = query_understanding.get("route", "")
 
@@ -199,7 +201,6 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
         # 兼容字段
         "intent": query_understanding,
         "assetnum": assetnum,
-        "task_type": task_type,
         "time_window": query_understanding.get("time_window"),
         "requires_asset": query_understanding.get("needs_asset"),
         "is_global": route in {"capability_query", "business_global", "direct_chat", "unsupported"},
@@ -207,12 +208,13 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
         "selected_tools": selected_tools,
         "tool_results": final_state.get("tool_results", {}),
         "tool_trace": tool_trace,
-        "evidence": _compat_evidence_from_packet(evidence_packet),
+        "evidence": _api_evidence_from_packet(evidence_packet),
         "final_answer": final_state.get("final_answer", ""),
         "errors": final_state.get("errors", []),
         "session_id": session_id,
         "last_assetnum": final_state.get("last_assetnum"),
-        "last_task_type": final_state.get("last_task_type"),
+        "last_route": final_state.get("last_route"),
+        "last_business_goal": final_state.get("last_business_goal"),
         # v0.3.0 新字段
         "context_packet": final_state.get("context_packet", {}),
         "query_understanding": final_state.get("query_understanding", {}),

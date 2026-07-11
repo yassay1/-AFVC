@@ -345,6 +345,107 @@ def build_risk_advice_report(evidence: dict[str, Any], query: str) -> str:
     )
 
 
+def build_fault_type_prediction_report(evidence: dict[str, Any], query: str) -> str:
+    """生成故障类型预测报告。
+
+    报告区分三个关键概率：
+    1. 总体故障风险（overall_failure_risk）
+    2. 条件故障类型概率（conditional_probability）
+    3. 综合估计发生概率（estimated_occurrence_probability）
+    """
+    fault_pred = evidence.get("fault_prediction", {}) or {}
+    risk = evidence.get("risk_prediction", {}) or {}
+
+    lines = ["【AFC 设备故障类型预测报告】", "", "一、设备信息"]
+    lines.extend(_device_header(evidence))
+
+    status = fault_pred.get("status", "unavailable")
+
+    if status == "unavailable" or not fault_pred:
+        lines.extend([
+            "",
+            "二、故障类型预测",
+            "当前暂无故障类型预测模型结果。",
+        ])
+        if risk:
+            lines.extend([
+                "",
+                "三、参考：总体故障风险",
+                f"- 30 天复发风险：{risk.get('risk_30d', '数据缺失')}",
+                f"- 90 天复发风险：{risk.get('risk_90d', '数据缺失')}",
+            ])
+        lines.extend([
+            "",
+            "说明：",
+            "- 系统目前仅支持风险预测（预测故障工单复发的总体概率）。",
+            "- 故障类型预测需要额外模型，当前暂不可用。",
+            "- 你可以尝试查询设备历史故障类型作为参考。",
+        ])
+        lines.extend(_scientific_boundary_lines())
+        lines.append("")
+        lines.append(f"工具来源：{', '.join(evidence.get('sources', []))}")
+        return "\n".join(lines)
+
+    if status == "error":
+        lines.extend([
+            "",
+            "二、故障类型预测",
+            f"预测服务异常：{fault_pred.get('message', '未知错误')}",
+        ])
+        lines.extend(_scientific_boundary_lines())
+        return "\n".join(lines)
+
+    # success
+    overall_risk = fault_pred.get("overall_failure_risk", 0.0)
+    window_days = fault_pred.get("prediction_window_days", 30)
+    most_likely = fault_pred.get("most_likely_fault") or {}
+    predictions = fault_pred.get("fault_type_predictions", []) or []
+
+    lines.extend([
+        "",
+        "二、总体故障风险",
+        f"- 预测窗口：{window_days} 天",
+        f"- 总体故障工单复发风险：{overall_risk:.0%}" if isinstance(overall_risk, (int, float)) else f"- 总体故障工单复发风险：{overall_risk}",
+        f"- 含义：在预测窗口内，设备再次产生故障工单的总体概率。",
+    ])
+
+    if most_likely:
+        ml_cond = most_likely.get("conditional_probability", 0)
+        ml_est = most_likely.get("estimated_occurrence_probability", 0)
+        lines.extend([
+            "",
+            "三、最可能故障类型",
+            f"- 故障类别：{most_likely.get('fault_name', '数据缺失')}（{most_likely.get('fault_code', '')}）",
+            f"- 条件概率：{ml_cond:.0%}" if isinstance(ml_cond, (int, float)) else f"- 条件概率：{ml_cond}",
+            f"- 综合估计发生概率：{ml_est:.0%}" if isinstance(ml_est, (int, float)) else f"- 综合估计发生概率：{ml_est}",
+            f"- 解读：如果预测窗口内发生故障，有 {ml_cond:.0%} 的条件概率属于该类别；" if isinstance(ml_cond, (int, float)) else "",
+            f"  结合总体风险估算，该类别故障实际发生概率约为 {ml_est:.0%}。" if isinstance(ml_est, (int, float)) else "",
+        ])
+
+    if predictions:
+        lines.extend(["", "四、所有故障类型预测（按条件概率排序）"])
+        for i, p in enumerate(predictions, 1):
+            cond = p.get("conditional_probability", 0)
+            est = p.get("estimated_occurrence_probability", 0)
+            cond_str = f"{cond:.0%}" if isinstance(cond, (int, float)) else str(cond)
+            est_str = f"{est:.0%}" if isinstance(est, (int, float)) else str(est)
+            lines.append(
+                f"{i}. {p.get('fault_name', '')}（{p.get('fault_code', '')}）"
+                f" — 条件概率：{cond_str}，综合估计发生概率：{est_str}"
+            )
+
+    # 预测说明
+    statement = fault_pred.get("prediction_statement", "")
+    if statement:
+        lines.extend(["", "五、预测说明", f"- {statement}"])
+
+    lines.extend(_scientific_boundary_lines())
+    lines.append("")
+    lines.append(f"工具来源：{', '.join(evidence.get('sources', []))}")
+
+    return "\n".join(lines)
+
+
 def build_full_diagnosis_report(evidence: dict[str, Any], query: str) -> str:
     """生成单设备完整诊断报告。"""
     lines = ["【AFC 设备智能诊断报告】", "", "一、设备识别结果"]

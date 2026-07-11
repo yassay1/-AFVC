@@ -6,7 +6,14 @@
 
 import logging
 from langchain_openai import ChatOpenAI
-from backend.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+from backend.core.config import (
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    OPENAI_MAX_RETRIES,
+    OPENAI_MODEL,
+    OPENAI_TIMEOUT_SECONDS,
+    is_llm_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +24,10 @@ _REPORT_LLM: ChatOpenAI | None = None
 
 def _create_chat_openai(temperature: float) -> ChatOpenAI:
     """创建 ChatOpenAI 实例，统一校验 API Key 配置。"""
+    if not is_llm_enabled():
+        raise RuntimeError(
+            "LLM calls are disabled. Set AFVC_USE_LLM=true to enable real model calls."
+        )
     if not OPENAI_API_KEY:
         raise RuntimeError(
             "OPENAI_API_KEY 未配置，请在 .env 文件中设置，"
@@ -28,6 +39,8 @@ def _create_chat_openai(temperature: float) -> ChatOpenAI:
         api_key=OPENAI_API_KEY,
         base_url=OPENAI_BASE_URL,
         temperature=temperature,
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
     )
 
 

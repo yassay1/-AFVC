@@ -1,0 +1,101 @@
+为避免项目以后再次出现中文乱码、非法字符、字符串损坏等问题，建议固定三层约束：编辑器、Git、脚本写文件。
+
+1. 统一使用 UTF-8
+
+在项目根目录加 .editorconfig：
+
+```ini
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+indent_style = space
+indent_size = 4
+```
+
+VS Code / PyCharm 都要确认默认编码是 UTF-8，不要用 GBK/ANSI 自动保存。
+
+2. 给 Git 加编码和换行约束
+
+新增 .gitattributes：
+
+```gitattributes
+*.py text working-tree-encoding=UTF-8 eol=crlf
+*.md text working-tree-encoding=UTF-8 eol=crlf
+*.txt text working-tree-encoding=UTF-8 eol=crlf
+*.json text working-tree-encoding=UTF-8 eol=crlf
+*.yml text working-tree-encoding=UTF-8 eol=crlf
+*.yaml text working-tree-encoding=UTF-8 eol=crlf
+```
+
+如果团队里有人用 macOS/Linux，也可以把 eol=lf 作为统一标准。重点是统一，不要混用。
+
+3. PowerShell 写文件必须显式 UTF-8
+
+避免：
+
+```powershell
+Set-Content file.py $content
+```
+
+使用：
+
+```powershell
+Set-Content -Path file.py -Value $content -Encoding UTF8
+```
+
+读取时也建议：
+
+```powershell
+Get-Content -Path file.py -Raw -Encoding UTF8
+```
+
+4. Python 读写文件必须指定编码
+
+```python
+from pathlib import Path
+
+text = Path("file.py").read_text(encoding="utf-8")
+Path("file.py").write_text(text, encoding="utf-8", newline="\n")
+```
+
+不要省略 encoding。
+
+5. 尽量避免用脚本批量改中文源码
+
+尤其是对 .py 文件做全局字符串替换时，要先运行：
+
+```bash
+python -m compileall backend frontend tests
+```
+
+替换后再跑一次。这样能尽早发现未闭合字符串、非法字符、f-string 损坏。
+
+6. 加一个乱码/非法字符检查脚本
+
+例如检查私用区字符和常见乱码：
+
+```powershell
+rg -n "[\uE000-\uF8FF]|鏁|璁|绋|锛|鈥|馃" backend frontend tests docs README.md
+```
+
+注意：锛、璁 这类字符不一定 100% 是乱码，但在中文源码里大量出现通常说明文件已损坏。
+
+7. CI 里至少跑这两个命令
+
+```bash
+python -m compileall -f backend frontend tests
+pytest
+```
+
+这次就是 compileall 先发现了前端字符串和不可打印字符问题。
+
+最关键的一条：以后不要让任何工具用“系统默认编码”读写项目文件，全部显式 UTF-8。
+
+
+工程化做法是用 .editorconfig + .gitattributes + 显式编码读写 + CI/提交前检查

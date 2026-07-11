@@ -1,438 +1,258 @@
-"""plan_tools_node —— 工具规划节点（v0.3.0 升级）。
-
-职责：
-根据 QueryUnderstanding（route + business_goal）+ ContextPacket + 已有证据，
-规划工具调用并决定 answer_mode。
-
-v0.3.0 升级：
-- 使用 route + business_goal 替代 task_type 做路由
-- 新增 answer_mode 字段
-- unknown/fallback 不再默认调用 get_integrated_analysis_tool
-"""
+"""Plan tool calls from route + business_goal."""
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from backend.agent.llm_json import call_llm_json
 from backend.agent.schemas import ToolPlan
 from backend.agent.state import AfcAgentState, NO_TOOL_ROUTES
 from backend.agent.tools import TOOL_BY_NAME
 from backend.core.llm import get_parse_llm
+from backend.agent.llm_json import call_llm_json
 
-
-# ── 工具描述 ──────────────────────────────────────────────────────
-
-def _build_tool_descriptions() -> str:
-    """构建可用工具列表描述。"""
-    lines: list[str] = []
-    for name, tool in TOOL_BY_NAME.items():
-        desc = getattr(tool, "description", "无描述")
-        lines.append(f"- {name}: {desc}")
-    return "\n".join(lines)
-
-
-# ── route + business_goal → (tools, answer_mode) 映射 ─────────
-
-# 需要 assetnum 的工具白名单
 _ASSET_REQUIRED_TOOLS = {
     "get_integrated_analysis_tool",
     "predict_device_risk_tool",
     "get_device_history_tool",
     "get_maintenance_advice_tool",
+    "predict_device_fault_type_tool",
 }
 
 ROUTE_TOOL_PLAN: dict[str, dict[str, Any]] = {
-    # ── 不需要工具 ──
     "direct_chat": {
         "tool_names": [],
         "answer_mode": "direct_chat",
-        "reason": "用户闲聊/问候，不需要调用业务工具",
+        "reason": "casual chat",
     },
     "capability_query": {
         "tool_names": [],
         "answer_mode": "capability_intro",
-        "reason": "用户询问系统能力，不需要调用业务工具",
+        "reason": "capability question",
     },
     "needs_clarification": {
         "tool_names": [],
         "answer_mode": "ask_for_assetnum",
-        "reason": "用户想做业务分析但缺少设备编号，需要追问",
+        "reason": "missing device id",
     },
     "unsupported": {
         "tool_names": [],
         "answer_mode": "unsupported",
-        "reason": "用户问题超出系统能力范围",
+        "reason": "unsupported question",
     },
-
-    # ── 全局业务 ──
     "business_global__data_overview": {
         "tool_names": ["get_data_summary_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户需要全局数据概览",
+        "reason": "global data overview",
     },
     "business_global__high_risk_ranking": {
         "tool_names": ["get_high_risk_devices_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户需要高风险设备清单",
+        "reason": "high risk device ranking",
     },
-
-    # ── 单设备业务 ──
     "business_device__device_risk": {
         "tool_names": ["predict_device_risk_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户查询单设备复发风险",
+        "reason": "device recurrence risk",
     },
     "business_device__device_history": {
         "tool_names": ["get_device_history_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户查询单设备历史工单",
+        "reason": "device work-order history",
     },
     "business_device__device_advice": {
         "tool_names": ["get_maintenance_advice_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户查询单设备维修建议",
+        "reason": "device maintenance advice",
+    },
+    "business_device__fault_type_prediction": {
+        "tool_names": ["predict_device_fault_type_tool"],
+        "answer_mode": "evidence_based",
+        "reason": "device fault type prediction",
     },
     "business_device__full_diagnosis": {
         "tool_names": ["get_integrated_analysis_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户需要单设备完整诊断",
+        "reason": "full device diagnosis",
     },
     "business_device__manual_search": {
         "tool_names": ["search_maintenance_manual_tool"],
         "answer_mode": "evidence_based",
-        "reason": "用户需要维修手册检索",
+        "reason": "maintenance manual search",
     },
 }
+
+
+def _extract_window_days(query: str) -> int:
+    import re
+
+    for pattern in (r"(\d+)\s*天", r"未来\s*(\d+)", r"(\d+)\s*日"):
+        match = re.search(pattern, query)
+        if not match:
+            continue
+        days = int(match.group(1))
+        from backend.domain.risk import SUPPORTED_PREDICTION_WINDOWS
+
+        if days in SUPPORTED_PREDICTION_WINDOWS:
+            return days
+    return 30
+
+
+def _build_tool_descriptions() -> str:
+    return "\n".join(
+        f"- {name}: {getattr(tool, 'description', '')}"
+        for name, tool in TOOL_BY_NAME.items()
+    )
+
+
+def _plan_key(route: str, business_goal: str | None) -> str:
+    if route in {"business_global", "business_device"}:
+        return f"{route}__{business_goal}"
+    return route
+
+
+def _tool_args(tool_name: str, state: AfcAgentState, assetnum: str | None) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if assetnum and tool_name in _ASSET_REQUIRED_TOOLS:
+        args["assetnum"] = assetnum
+    if tool_name in {"get_data_summary_tool", "get_high_risk_devices_tool"}:
+        args["top_n"] = 10
+    if tool_name == "get_device_history_tool":
+        args["assetnum"] = assetnum
+        args["limit"] = 50
+    if tool_name == "get_integrated_analysis_tool":
+        args["assetnum"] = assetnum
+        args["history_limit"] = 50
+    if tool_name == "search_maintenance_manual_tool":
+        args["query"] = state.get("query", "")
+        args["assetnum"] = assetnum
+    if tool_name == "predict_device_fault_type_tool":
+        args["assetnum"] = assetnum
+        args["window_days"] = _extract_window_days(state.get("query", ""))
+        args["top_k"] = 3
+    return args
 
 
 def _plan_by_route(
     query_understanding: dict[str, Any],
     state: AfcAgentState,
 ) -> dict[str, Any]:
-    """根据 route + business_goal 规划工具调用和 answer_mode。"""
     route = query_understanding.get("route", "direct_chat")
     business_goal = query_understanding.get("business_goal")
     assetnum = query_understanding.get("assetnum")
 
-    # business_device 但缺少 assetnum → 追问
     if route == "business_device" and not assetnum:
         return {
             "tool_calls": [],
             "use_existing_evidence": False,
-            "reason": "缺少设备编号，无法规划工具",
+            "reason": "missing device id",
             "answer_mode": "ask_for_assetnum",
             "answer_policy": {"missing_asset": True},
         }
 
-    # 查找规划表
-    plan_key = route if route not in ("business_global", "business_device") else f"{route}__{business_goal}"
-    plan = ROUTE_TOOL_PLAN.get(plan_key)
-
+    plan = ROUTE_TOOL_PLAN.get(_plan_key(route, business_goal))
     if plan is None:
-        # 未知组合：不默认调用工具
         if route in NO_TOOL_ROUTES:
-            return {
-                "tool_calls": [],
-                "use_existing_evidence": False,
-                "reason": f"非业务路由 {route}，不需要工具",
-                "answer_mode": "direct_chat",
-                "answer_policy": {},
-            }
-        # 业务路由但无匹配 plan → 回退为 full_diagnosis（仅当有 assetnum）
-        if assetnum:
-            plan = ROUTE_TOOL_PLAN.get("business_device__full_diagnosis", {})
+            plan = ROUTE_TOOL_PLAN[route]
+        elif assetnum:
+            plan = ROUTE_TOOL_PLAN["business_device__full_diagnosis"]
         else:
             return {
                 "tool_calls": [],
                 "use_existing_evidence": False,
-                "reason": f"未知业务组合 route={route} goal={business_goal} 且无设备编号",
+                "reason": f"unknown route/goal: {route}/{business_goal}",
                 "answer_mode": "ask_for_assetnum",
                 "answer_policy": {},
             }
 
-    # 构建 tool_calls
-    tool_calls = []
-    for tool_name in plan.get("tool_names", []):
-        args: dict[str, Any] = {}
-        if assetnum and tool_name in _ASSET_REQUIRED_TOOLS:
-            args["assetnum"] = assetnum
-        if tool_name == "get_data_summary_tool":
-            args["top_n"] = 10
-        if tool_name == "get_high_risk_devices_tool":
-            args["top_n"] = 10
-        if tool_name == "get_device_history_tool":
-            args["assetnum"] = assetnum
-            args["limit"] = 50
-        if tool_name == "get_integrated_analysis_tool":
-            args["assetnum"] = assetnum
-            args["history_limit"] = 50
-        if tool_name == "search_maintenance_manual_tool":
-            args["query"] = state.get("query", "")
-            args["assetnum"] = assetnum
-
-        tool_calls.append({
+    tool_calls = [
+        {
             "tool_name": tool_name,
-            "args": args,
-            "purpose": plan.get("reason", ""),
+            "args": _tool_args(tool_name, state, assetnum),
+            "purpose": plan["reason"],
             "expected_evidence": [],
-        })
+        }
+        for tool_name in plan.get("tool_names", [])
+    ]
 
     return {
         "tool_calls": tool_calls,
         "use_existing_evidence": len(tool_calls) == 0,
-        "reason": plan.get("reason", ""),
-        "answer_mode": plan.get("answer_mode", "direct_chat"),
+        "reason": plan["reason"],
+        "answer_mode": plan["answer_mode"],
         "answer_policy": {
             "must_not_predict_exact_failure_date": True,
-            "must_answer_with_risk_window": business_goal == "device_risk" or business_goal == "full_diagnosis",
+            "must_answer_with_risk_window": business_goal in {"device_risk", "full_diagnosis"},
         },
     }
 
 
-TOOL_PLAN_OUTPUT_CONTRACT = """## ToolPlan JSON output contract
-Return exactly one JSON object that validates against ToolPlan.
-
-Root object MUST contain all of these fields:
-- tool_calls: array
-- use_existing_evidence: boolean
-- reason: non-empty string
-- answer_mode: one of direct_chat, capability_intro, ask_for_assetnum, evidence_based, unsupported
-- answer_policy: object
-
-Each item in tool_calls MUST contain all of these fields:
-- tool_name: string, must be one of the available tool names
-- args: object
-- purpose: non-empty string
-- expected_evidence: array of strings
-
-Field name rules:
-- NEVER use a field named "tool".
-- ALWAYS use "tool_name" for the tool name.
-- If repairing invalid JSON that used "tool", rename it to "tool_name" and add any missing required fields.
-- Do not wrap the result in any state or node field.
-"""
-
-
-TOOL_PLAN_JSON_SKELETON = """## Required JSON skeleton
-{
-  "tool_calls": [
-    {
-      "tool_name": "<available_tool_name>",
-      "args": {},
-      "purpose": "<why this tool is needed>",
-      "expected_evidence": ["<evidence_field_name>"]
-    }
-  ],
-  "use_existing_evidence": false,
-  "reason": "<why this plan satisfies the query>",
-  "answer_mode": "evidence_based",
-  "answer_policy": {}
-}
-
-For no-tool plans, use:
-{
-  "tool_calls": [],
-  "use_existing_evidence": true,
-  "reason": "<why no tool is needed>",
-  "answer_mode": "<direct_chat|capability_intro|ask_for_assetnum|unsupported>",
-  "answer_policy": {}
-}
-"""
-
-
-DEVICE_ADVICE_FEW_SHOT = """## Few-shot example
-Input:
-{
-  "route": "business_device",
-  "business_goal": "device_advice",
-  "assetnum": "1000029970",
-  "needs_tools": true
-}
-
-Correct ToolPlan output:
-{
-  "tool_calls": [
-    {
-      "tool_name": "get_maintenance_advice_tool",
-      "args": {"assetnum": "1000029970"},
-      "purpose": "Get maintenance and inspection advice for device 1000029970.",
-      "expected_evidence": ["maintenance_advice"]
-    }
-  ],
-  "use_existing_evidence": false,
-  "reason": "business_goal=device_advice requires maintenance advice evidence for the target device.",
-  "answer_mode": "evidence_based",
-  "answer_policy": {
-    "must_not_predict_exact_failure_date": true,
-    "must_answer_with_risk_window": false
-  }
-}
-"""
-
-
-PLAN_TOOLS_SYSTEM = """你是 AFC 智能运维 Agent 的工具规划器。
-
-你的任务是：根据问题理解和上下文，规划需要调用的工具并决定 answer_mode。
-你只规划工具，不回答用户问题。
-
-## 可用工具
-{tool_descriptions}
-
-## answer_mode 语义
-- direct_chat: 闲聊，不调工具
-- capability_intro: 系统能力介绍，不调工具
-- ask_for_assetnum: 缺设备编号，追问
-- evidence_based: 需要工具证据
-- unsupported: 超出能力范围
-
-## 规划原则（按 route 决定）
-1. direct_chat → tool_calls=[], answer_mode=direct_chat
-2. capability_query → tool_calls=[], answer_mode=capability_intro
-3. needs_clarification → tool_calls=[], answer_mode=ask_for_assetnum
-4. unsupported → tool_calls=[], answer_mode=unsupported
-5. business_global + data_overview → get_data_summary_tool, answer_mode=evidence_based
-6. business_global + high_risk_ranking → get_high_risk_devices_tool, answer_mode=evidence_based
-7. business_device + 缺 assetnum → tool_calls=[], answer_mode=ask_for_assetnum
-8. business_device + device_risk → predict_device_risk_tool, answer_mode=evidence_based
-9. business_device + device_history → get_device_history_tool, answer_mode=evidence_based
-10. business_device + device_advice → get_maintenance_advice_tool, answer_mode=evidence_based
-11. business_device + full_diagnosis → get_integrated_analysis_tool, answer_mode=evidence_based
-12. business_device + manual_search → search_maintenance_manual_tool, answer_mode=evidence_based
-13. unknown / fallback → 不要默认调用 get_integrated_analysis_tool
-
-## 输出
-{output_contract}
-
-{json_skeleton}
-
-{few_shot}
-
-只输出一个合法的 ToolPlan JSON 对象，不要输出 markdown、解释文字或节点状态包装对象。"""
-
-
-TOOL_PLAN_FINAL_CONTRACT = """## 最终输出格式要求
-只输出一个合法 JSON object，不要 markdown，不要解释文字。
-JSON 根对象必须直接包含这些字段：
-tool_calls, use_existing_evidence, reason, answer_mode, answer_policy。
-tool_calls 中每个对象必须直接包含 tool_name, args, purpose, expected_evidence。
-不要增加任何外层包装字段，不要输出节点状态对象。
-字段名必须使用 tool_name，不要使用其他工具名称字段。
+TOOL_PLAN_SYSTEM = """You plan AFC Agent tool calls.
+Use only route and business_goal. Return JSON matching ToolPlan.
 """
 
 
 def _build_plan_tools_prompt(query_understanding: dict[str, Any], evidence_packet: dict[str, Any]) -> str:
-    """Build the user prompt for ToolPlan generation."""
     return (
-        f"{TOOL_PLAN_OUTPUT_CONTRACT}\n"
-        f"{TOOL_PLAN_JSON_SKELETON}\n"
-        f"{DEVICE_ADVICE_FEW_SHOT}\n"
-        f"## 问题理解\n{json.dumps(query_understanding, ensure_ascii=False, indent=2)}\n"
-        f"\n## 已有证据\n{json.dumps(evidence_packet, ensure_ascii=False, indent=2) if evidence_packet else '无'}\n"
-        f"\n{TOOL_PLAN_FINAL_CONTRACT}"
-        f"\n## JSON skeleton\n{TOOL_PLAN_JSON_SKELETON}\n"
+        f"Available tools:\n{_build_tool_descriptions()}\n\n"
+        f"Query understanding:\n{query_understanding}\n\n"
+        f"Existing evidence:\n{evidence_packet}\n"
     )
 
 
 def plan_tools_node(state: AfcAgentState) -> dict[str, Any]:
-    """规划工具调用（v0.3.0 升级版）。
-
-    输入：query_understanding (route + business_goal), context_packet, evidence_packet
-    输出：tool_plan (含 answer_mode) + answer_policy
-    """
     query_understanding = state.get("query_understanding", {})
     route = query_understanding.get("route", "direct_chat")
-    business_goal = query_understanding.get("business_goal")
     assetnum = query_understanding.get("assetnum")
-    needs_tools = query_understanding.get("needs_tools", route in ("business_global", "business_device"))
+    needs_tools = query_understanding.get(
+        "needs_tools", route in {"business_global", "business_device"}
+    )
     errors: list[str] = list(state.get("errors", []))
-    evidence_packet = state.get("evidence_packet", {})
 
-    # ── 不需要工具的 route → 直接返回 ──
-    if route in NO_TOOL_ROUTES:
+    if route in NO_TOOL_ROUTES or (route == "business_device" and not assetnum):
         plan = _plan_by_route(query_understanding, state)
-        return {
-            "tool_plan": plan,
-            "answer_policy": plan.get("answer_policy", {}),
-            "errors": errors,
-        }
+        return {"tool_plan": plan, "answer_policy": plan.get("answer_policy", {}), "errors": errors}
 
-    # ── business_device 但缺少 assetnum ──
-    if route == "business_device" and not assetnum:
-        plan = _plan_by_route(query_understanding, state)
-        return {
-            "tool_plan": plan,
-            "answer_policy": plan.get("answer_policy", {}),
-            "errors": errors,
-        }
-
-    # ── 需要工具：尝试 LLM 规划 ──
     tool_plan: dict[str, Any] | None = None
     try:
         llm = get_parse_llm()
-        tool_descriptions = _build_tool_descriptions()
-        system_prompt = PLAN_TOOLS_SYSTEM.format(
-            tool_descriptions=tool_descriptions,
-            output_contract=TOOL_PLAN_OUTPUT_CONTRACT,
-            json_skeleton=TOOL_PLAN_JSON_SKELETON,
-            few_shot=DEVICE_ADVICE_FEW_SHOT,
+        prompt = _build_plan_tools_prompt(
+            query_understanding, state.get("evidence_packet", {})
         )
-
-        prompt = _build_plan_tools_prompt(query_understanding, evidence_packet)
-        repair_context = (
-            f"{prompt}\n\n"
-            "Repair reminder: convert any tool_calls[].tool field to tool_calls[].tool_name. "
-            "Every tool call must include tool_name, args, purpose, expected_evidence. "
-            "The root object must include tool_calls, use_existing_evidence, reason, answer_mode, answer_policy. "
-            "Do not wrap the object in any state or node field. "
-            "Use this exact shape:\n"
-            f"{TOOL_PLAN_JSON_SKELETON}"
-        )
-
         result = call_llm_json(
             llm=llm,
             prompt=prompt,
             schema=ToolPlan,
-            system_prompt=system_prompt,
+            system_prompt=TOOL_PLAN_SYSTEM,
             max_repair_attempts=2,
-            repair_context=repair_context,
+            repair_context=prompt,
         )
         tool_plan = result.model_dump()
     except Exception as exc:
-        errors.append(f"LLM 工具规划不可用，使用规则兜底：{str(exc)}")
+        errors.append(f"LLM tool planning unavailable, used rule fallback: {str(exc)}")
 
-    # 规则兜底
-    if tool_plan is None:
+    if tool_plan is None or (not tool_plan.get("tool_calls") and needs_tools):
         tool_plan = _plan_by_route(query_understanding, state)
 
-    # 如果 tool_calls 为空，使用规则兜底
-    if not tool_plan.get("tool_calls") and needs_tools:
-        tool_plan = _plan_by_route(query_understanding, state)
-
-    # ── 后处理：确保 answer_mode 存在 ──
-    if not tool_plan.get("answer_mode"):
-        tool_plan["answer_mode"] = _plan_by_route(query_understanding, state).get("answer_mode", "direct_chat")
-
-    # ── 后处理：manual_query 确保有 RAG 工具 ──
+    business_goal = query_understanding.get("business_goal")
     if business_goal == "manual_search" or query_understanding.get("needs_rag"):
         has_rag = any(
-            tc.get("tool_name") == "search_maintenance_manual_tool"
-            for tc in tool_plan.get("tool_calls", [])
+            call.get("tool_name") == "search_maintenance_manual_tool"
+            for call in tool_plan.get("tool_calls", [])
         )
         if not has_rag and "search_maintenance_manual_tool" in TOOL_BY_NAME:
-            tool_plan.setdefault("tool_calls", []).append({
-                "tool_name": "search_maintenance_manual_tool",
-                "args": {"query": state.get("query", ""), "assetnum": assetnum},
-                "purpose": "按用户要求检索维修手册",
-                "expected_evidence": ["manual_steps", "manual_cause"],
-            })
+            tool_plan.setdefault("tool_calls", []).append(
+                {
+                    "tool_name": "search_maintenance_manual_tool",
+                    "args": {"query": state.get("query", ""), "assetnum": assetnum},
+                    "purpose": "maintenance manual search",
+                    "expected_evidence": ["manual_steps", "manual_cause"],
+                }
+            )
 
-    # ── 后处理：为需要 assetnum 的工具补齐参数 ──
     if assetnum:
-        for tc in tool_plan.get("tool_calls", []):
-            if not tc.get("args", {}).get("assetnum") and tc.get("tool_name") in _ASSET_REQUIRED_TOOLS:
-                tc.setdefault("args", {})["assetnum"] = assetnum
+        for call in tool_plan.get("tool_calls", []):
+            if call.get("tool_name") in _ASSET_REQUIRED_TOOLS:
+                call.setdefault("args", {}).setdefault("assetnum", assetnum)
 
     return {
         "tool_plan": tool_plan,

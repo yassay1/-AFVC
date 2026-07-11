@@ -4,6 +4,7 @@ from typing import Any
 from backend.services.device_service import get_device_history
 from backend.services.prediction_service import predict_device_risk
 from backend.services.advice_service import generate_device_advice
+from backend.services.fault_prediction_service import predict_device_fault_type
 
 
 def _get_value_from_sources(key: str, *sources: dict[str, Any]) -> Any:
@@ -73,6 +74,24 @@ def generate_device_analysis(assetnum: str, history_limit: int = 50) -> dict[str
     prediction_result = predict_device_risk(target_assetnum)
 
     advice_result = generate_device_advice(target_assetnum)
+
+    # ── 故障类型预测（新增）──
+    try:
+        fault_prediction = predict_device_fault_type(
+            assetnum=target_assetnum,
+            window_days=30,
+            top_k=3,
+        )
+    except Exception:
+        fault_prediction = {
+            "status": "unavailable",
+            "message": "故障类型预测服务暂不可用",
+            "assetnum": target_assetnum,
+            "prediction_window_days": 30,
+            "overall_failure_risk": 0.0,
+            "most_likely_fault": None,
+            "fault_type_predictions": [],
+        }
 
     history = history_result.get("history", [])
 
@@ -144,10 +163,12 @@ def generate_device_analysis(assetnum: str, history_limit: int = 50) -> dict[str
         },
         "risk_prediction": risk_prediction,
         "maintenance_advice": maintenance_advice,
+        "fault_prediction": fault_prediction,
         "called_tools": [
             "get_device_history",
             "predict_device_risk",
             "generate_device_advice",
+            "predict_device_fault_type",
         ],
         "analysis_statement": (
             "本分析基于历史维修工单记录、模拟风险预测和规则维修建议生成。"
