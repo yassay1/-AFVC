@@ -16,6 +16,7 @@ class AfcAgentState(TypedDict, total=False):
     evidence_packet: dict[str, Any]
     evidence_evaluation: dict[str, Any]
     answer_policy: dict[str, Any]
+    generated_answer: dict[str, Any]
     final_answer: str
     memory_update: dict[str, Any]
     tool_loop_count: int
@@ -45,6 +46,7 @@ CAPABILITY_BOUNDARY: dict[str, Any] = {
 NO_DEVICE_ROUTES = {
     "direct_chat",
     "capability_query",
+    "conversation",
     "business_global",
     "unsupported",
 }
@@ -52,6 +54,7 @@ NO_DEVICE_ROUTES = {
 NO_TOOL_ROUTES = {
     "direct_chat",
     "capability_query",
+    "conversation",
     "needs_clarification",
     "unsupported",
 }
@@ -59,6 +62,7 @@ NO_TOOL_ROUTES = {
 CHAT_ROUTES = {
     "direct_chat",
     "capability_query",
+    "conversation",
     "unsupported",
 }
 
@@ -74,6 +78,7 @@ def create_initial_state(query: str) -> AfcAgentState:
         "evidence_packet": {},
         "evidence_evaluation": {},
         "answer_policy": {},
+        "generated_answer": {},
         "final_answer": "",
         "memory_update": {},
         "tool_loop_count": 0,

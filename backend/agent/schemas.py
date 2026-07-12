@@ -31,6 +31,7 @@ class ContextPacket(StrictModel):
 Route = Literal[
     "direct_chat",
     "capability_query",
+    "conversation",
     "business_global",
     "business_device",
     "needs_clarification",
@@ -46,6 +47,8 @@ BusinessGoal = Literal[
     "fault_type_prediction",
     "full_diagnosis",
     "manual_search",
+    "general_explanation",
+    "open_analysis",
     None,
 ]
 
@@ -56,8 +59,6 @@ class QueryUnderstanding(StrictModel):
     assetnum: str | None = None
     time_window: str | None = None
     needs_asset: bool
-    needs_tools: bool
-    needs_rag: bool
     context_used: bool
     information_need: str
     user_question_rewrite: str
@@ -72,8 +73,6 @@ class QueryUnderstanding(StrictModel):
                 raise ValueError("route=business_device requires assetnum")
             if not self.needs_asset:
                 raise ValueError("route=business_device requires needs_asset=true")
-            if not self.needs_tools:
-                raise ValueError("route=business_device requires needs_tools=true")
 
         if self.route == "business_global":
             if self.business_goal not in {"data_overview", "high_risk_ranking"}:
@@ -82,22 +81,29 @@ class QueryUnderstanding(StrictModel):
                 raise ValueError("route=business_global must not include assetnum")
             if self.needs_asset:
                 raise ValueError("route=business_global requires needs_asset=false")
-            if not self.needs_tools:
-                raise ValueError("route=business_global requires needs_tools=true")
+
+        if self.route == "conversation":
+            if self.business_goal not in {"general_explanation", None}:
+                raise ValueError("route=conversation only allows general_explanation or null")
+            if self.needs_asset:
+                raise ValueError("route=conversation requires needs_asset=false")
+            if self.assetnum:
+                raise ValueError("route=conversation must not include assetnum")
 
         if self.route in {"direct_chat", "capability_query", "unsupported"}:
-            if self.needs_tools:
-                raise ValueError(f"route={self.route} requires needs_tools=false")
             if self.needs_asset:
                 raise ValueError(f"route={self.route} requires needs_asset=false")
             if self.business_goal is not None:
                 raise ValueError(f"route={self.route} requires business_goal=null")
 
         if self.route == "needs_clarification":
-            if self.needs_tools:
-                raise ValueError("route=needs_clarification requires needs_tools=false")
             if self.assetnum:
                 raise ValueError("route=needs_clarification must not include assetnum")
+
+        if self.business_goal == "open_analysis" and self.route != "business_device":
+            raise ValueError("open_analysis requires route=business_device")
+        if self.business_goal == "general_explanation" and self.route != "conversation":
+            raise ValueError("general_explanation requires route=conversation")
 
         return self
 
@@ -109,6 +115,18 @@ class ToolCallPlanItem(StrictModel):
     expected_evidence: list[str] = Field(default_factory=list)
 
 
+class AnswerPolicy(StrictModel):
+    style: Literal["concise", "standard", "detailed", "sop"] = "standard"
+    must_use_evidence: bool = False
+    allow_general_knowledge: bool = False
+    must_cite_sources: bool = False
+    must_include_boundary: bool = False
+    must_not_predict_exact_failure_date: bool = True
+    must_not_fabricate_device_data: bool = True
+    must_not_fabricate_manual_content: bool = True
+    forbidden_claims: list[str] = Field(default_factory=list)
+
+
 class ToolPlan(StrictModel):
     tool_calls: list[ToolCallPlanItem] = Field(default_factory=list)
     use_existing_evidence: bool = False
@@ -118,9 +136,10 @@ class ToolPlan(StrictModel):
         "capability_intro",
         "ask_for_assetnum",
         "evidence_based",
+        "conversational",
         "unsupported",
     ] = "direct_chat"
-    answer_policy: dict[str, Any] = Field(default_factory=dict)
+    answer_policy: AnswerPolicy = Field(default_factory=AnswerPolicy)
 
 
 class ToolExecutionResult(StrictModel):
@@ -144,27 +163,32 @@ class EvidencePacket(StrictModel):
     fault_prediction: dict[str, Any] | None = None
     data_overview: dict[str, Any] | None = None
     high_risk_devices: list[dict[str, Any]] | None = None
+    available_evidence: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     tool_errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EvidenceEvaluation(StrictModel):
-    answerable: bool
-    need_more_tools: bool
+    decision: Literal["proceed", "replan", "clarify", "stop"]
+    evidence_sufficient: bool
     missing_evidence: list[str] = Field(default_factory=list)
-    suggested_next_tools: list[ToolCallPlanItem] = Field(default_factory=list)
     reason: str
+    evaluation_method: Literal["rule", "llm", "hybrid"] = "rule"
 
 
-class AnswerPolicy(StrictModel):
-    must_not_predict_exact_failure_date: bool = True
-    must_answer_with_risk_window: bool = True
-    must_cite_sources: bool = True
-    must_state_uncertainty: bool = True
-    must_not_fabricate_device_data: bool = True
-    must_not_fabricate_manual_content: bool = True
-    allowed_formats: list[str] = Field(default_factory=lambda: ["text", "markdown"])
+class GeneratedAnswer(StrictModel):
+    answer_type: Literal[
+        "direct_chat", "capability", "clarification", "grounded",
+        "conversational", "unsupported", "error",
+    ]
+    direct_answer: str
+    key_evidence: list[str] = Field(default_factory=list)
+    analysis: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    boundary_notice: str | None = None
+    follow_up_question: str | None = None
 
 
 class MemoryUpdate(StrictModel):

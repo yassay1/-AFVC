@@ -1,0 +1,817 @@
+AFVC Agent 修改复盘
+日期：2026-07-12
+范围：仅后端八节点 LangGraph Agent、Schema、LLM JSON 结构化处理和测试
+说明：本文件不包含 Streamlit 前端、UI 样式及前端加载状态相关修改。
+
+======================================================================
+一、修改目标
+======================================================================
+
+本次修改在保持八节点工作流、业务工具、预测模型、API、会话机制和最大工具循环次数不变的前提下，将 Agent 从“固定枚举 + 模板为主”升级为：
+
+1. understand_query：区分普通闲聊、能力询问、AFC 一般解释、固定业务和开放组合分析。
+2. plan_tools：固定业务规则规划，只有 open_analysis 使用 LLM 工具规划。
+3. evaluate_evidence：固定业务规则评估，只有 open_analysis 使用 LLM 辅助评估。
+4. generate_answer：所有回答先形成 GeneratedAnswer，再由代码统一渲染 Markdown。
+5. 普通业务报告和 manual_search 优先由 LLM 生成，report_builder 仅作异常兜底。
+6. LLM 输出全部经过 JSON 提取、Pydantic 严格校验和最多两次 repair。
+
+八节点结构保持：
+
+START
+→ prepare_context
+→ understand_query
+→ plan_tools
+→ execute_tools
+→ merge_evidence
+→ evaluate_evidence
+→ generate_answer
+→ update_memory
+→ END
+
+evaluate_evidence 仍可通过 decision=replan 返回 plan_tools，MAX_TOOL_LOOPS 保持为 2。
+
+======================================================================
+二、Schema 修改前后对比
+======================================================================
+
+---------------------------------------------------------------------
+2.1 StrictModel
+---------------------------------------------------------------------
+
+当前所有新增和核心 Agent Schema 统一继承：
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+影响：
+- 多余字段直接校验失败。
+- 不允许模型私自添加 input、output、解释字段或状态包装。
+- 本次未降低严格程度。
+
+---------------------------------------------------------------------
+2.2 Route
+---------------------------------------------------------------------
+
+修改前：
+
+Route = Literal[
+    "direct_chat",
+    "capability_query",
+    "business_global",
+    "business_device",
+    "needs_clarification",
+    "unsupported",
+]
+
+修改后：
+
+Route = Literal[
+    "direct_chat",
+    "capability_query",
+    "conversation",
+    "business_global",
+    "business_device",
+    "needs_clarification",
+    "unsupported",
+]
+
+新增 conversation：
+- 用于 AFC 风险概率、模型原理、运维概念等一般解释。
+- 不要求设备编号。
+- 不依赖具体设备业务工具。
+
+---------------------------------------------------------------------
+2.3 BusinessGoal
+---------------------------------------------------------------------
+
+修改前：
+
+BusinessGoal = Literal[
+    "data_overview",
+    "high_risk_ranking",
+    "device_risk",
+    "device_history",
+    "device_advice",
+    "fault_type_prediction",
+    "full_diagnosis",
+    "manual_search",
+    None,
+]
+
+修改后：
+
+BusinessGoal = Literal[
+    "data_overview",
+    "high_risk_ranking",
+    "device_risk",
+    "device_history",
+    "device_advice",
+    "fault_type_prediction",
+    "full_diagnosis",
+    "manual_search",
+    "general_explanation",
+    "open_analysis",
+    None,
+]
+
+新增：
+
+general_explanation
+- AFC 一般知识、风险概率和模型含义解释。
+- 原则上只能搭配 route=conversation。
+
+open_analysis
+- 综合风险、历史、维修建议、手册等多维证据的开放问题。
+- 原则上只能搭配 route=business_device，并要求 assetnum。
+
+---------------------------------------------------------------------
+2.4 QueryUnderstanding
+---------------------------------------------------------------------
+
+修改前字段：
+
+class QueryUnderstanding(StrictModel):
+    route: Route
+    business_goal: BusinessGoal
+    assetnum: str | None
+    time_window: str | None
+    needs_asset: bool
+    needs_tools: bool
+    needs_rag: bool
+    context_used: bool
+    information_need: str
+    user_question_rewrite: str
+    confidence: float
+
+修改后完整字段：
+
+class QueryUnderstanding(StrictModel):
+    route: Route = "direct_chat"
+    business_goal: BusinessGoal = None
+    assetnum: str | None = None
+    time_window: str | None = None
+    needs_asset: bool
+    context_used: bool
+    information_need: str
+    user_question_rewrite: str
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+删除：
+- needs_tools
+- needs_rag
+
+删除原因：
+- 是否调用工具、是否调用 RAG 属于 plan_tools 的职责。
+- understand_query 只负责语义理解，不负责执行策略。
+
+当前跨字段校验规则：
+
+1. route=business_device
+   - 必须有 business_goal。
+   - 必须有 assetnum。
+   - needs_asset 必须为 true。
+
+2. route=business_global
+   - business_goal 只能是 data_overview 或 high_risk_ranking。
+   - 不允许 assetnum。
+   - needs_asset 必须为 false。
+
+3. route=conversation
+   - business_goal 只能是 general_explanation 或 null。
+   - 不允许 assetnum。
+   - needs_asset 必须为 false。
+
+4. direct_chat/capability_query/unsupported
+   - business_goal 必须为 null。
+   - needs_asset 必须为 false。
+
+5. needs_clarification
+   - 不允许携带 assetnum。
+
+6. open_analysis
+   - 必须搭配 business_device。
+
+7. general_explanation
+   - 必须搭配 conversation。
+
+---------------------------------------------------------------------
+2.5 AnswerPolicy
+---------------------------------------------------------------------
+
+修改前：
+
+class AnswerPolicy(StrictModel):
+    must_not_predict_exact_failure_date: bool = True
+    must_answer_with_risk_window: bool = True
+    must_cite_sources: bool = True
+    must_state_uncertainty: bool = True
+    must_not_fabricate_device_data: bool = True
+    must_not_fabricate_manual_content: bool = True
+    allowed_formats: list[str] = ["text", "markdown"]
+
+修改后完整结构：
+
+class AnswerPolicy(StrictModel):
+    style: Literal[
+        "concise",
+        "standard",
+        "detailed",
+        "sop",
+    ] = "standard"
+
+    must_use_evidence: bool = False
+    allow_general_knowledge: bool = False
+    must_cite_sources: bool = False
+    must_include_boundary: bool = False
+
+    must_not_predict_exact_failure_date: bool = True
+    must_not_fabricate_device_data: bool = True
+    must_not_fabricate_manual_content: bool = True
+
+    forbidden_claims: list[str] = Field(default_factory=list)
+
+style 识别：
+- 简单说、简洁、直接说 → concise
+- 详细分析、完整报告 → detailed
+- 按步骤、SOP、操作流程 → sop
+- 默认 → standard
+
+主要变化：
+- 回答模式、证据要求、通用知识权限和科学边界成为显式字段。
+- ToolPlan.answer_policy 不再使用无约束 dict。
+
+---------------------------------------------------------------------
+2.6 ToolPlan
+---------------------------------------------------------------------
+
+修改前：
+
+class ToolPlan(StrictModel):
+    tool_calls: list[ToolCallPlanItem]
+    use_existing_evidence: bool
+    reason: str
+    answer_mode: Literal[
+        "direct_chat",
+        "capability_intro",
+        "ask_for_assetnum",
+        "evidence_based",
+        "unsupported",
+    ]
+    answer_policy: dict[str, Any]
+
+修改后完整结构：
+
+class ToolPlan(StrictModel):
+    tool_calls: list[ToolCallPlanItem] = Field(default_factory=list)
+    use_existing_evidence: bool = False
+    reason: str
+    answer_mode: Literal[
+        "direct_chat",
+        "capability_intro",
+        "ask_for_assetnum",
+        "evidence_based",
+        "conversational",
+        "unsupported",
+    ] = "direct_chat"
+    answer_policy: AnswerPolicy = Field(default_factory=AnswerPolicy)
+
+新增 conversational：
+- AFC 一般解释走独立对话模型。
+- 默认不调用业务工具。
+- 允许通用 AFC 知识，但禁止虚构具体设备事实。
+
+---------------------------------------------------------------------
+2.7 EvidencePacket
+---------------------------------------------------------------------
+
+修改前主要字段：
+
+class EvidencePacket(StrictModel):
+    assetnum
+    device_profile
+    history_summary
+    risk_prediction
+    warning
+    maintenance_advice
+    manual_evidence
+    fault_prediction
+    data_overview
+    high_risk_devices
+    sources
+    missing_evidence
+    tool_errors
+
+修改后新增：
+
+available_evidence: list[str] = Field(default_factory=list)
+
+当前完整证据类型包括：
+- risk_prediction
+- history_summary
+- maintenance_advice
+- manual_evidence
+- fault_prediction
+- data_overview
+- high_risk_devices
+- device_profile
+- warning
+
+计算逻辑：
+
+available_evidence
+= EvidencePacket 中实际非空的证据字段
+
+expected_evidence
+= 当前 ToolPlan.tool_calls[*].expected_evidence 的并集
+
+missing_evidence
+= expected_evidence - available_evidence
+
+对于 open_analysis，主要依据 ToolPlan.expected_evidence，而不是固定业务枚举。
+
+---------------------------------------------------------------------
+2.8 EvidenceEvaluation
+---------------------------------------------------------------------
+
+修改前：
+
+class EvidenceEvaluation(StrictModel):
+    answerable: bool
+    need_more_tools: bool
+    missing_evidence: list[str]
+    suggested_next_tools: list[ToolCallPlanItem]
+    reason: str
+
+修改后完整结构：
+
+class EvidenceEvaluation(StrictModel):
+    decision: Literal[
+        "proceed",
+        "replan",
+        "clarify",
+        "stop",
+    ]
+
+    evidence_sufficient: bool
+    missing_evidence: list[str] = Field(default_factory=list)
+    reason: str
+    evaluation_method: Literal[
+        "rule",
+        "llm",
+        "hybrid",
+    ] = "rule"
+
+删除：
+- answerable
+- need_more_tools
+- suggested_next_tools
+
+语义拆分：
+
+evidence_sufficient
+- 只表示证据是否足以支持回答。
+
+decision
+- proceed：进入回答阶段。
+- replan：还能通过工具补证据，返回 plan_tools。
+- clarify：缺用户必须提供的参数。
+- stop：工具失败、达到上限或证据无法再补，进入回答节点诚实说明。
+
+解决的问题：
+- 不再出现“所有工具失败但 answerable=true”的语义冲突。
+- 证据充分性和工作流动作不再混为一谈。
+
+---------------------------------------------------------------------
+2.9 GeneratedAnswer（新增）
+---------------------------------------------------------------------
+
+新增完整结构：
+
+class GeneratedAnswer(StrictModel):
+    answer_type: Literal[
+        "direct_chat",
+        "capability",
+        "clarification",
+        "grounded",
+        "conversational",
+        "unsupported",
+        "error",
+    ]
+
+    direct_answer: str
+    key_evidence: list[str] = Field(default_factory=list)
+    analysis: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    boundary_notice: str | None = None
+    follow_up_question: str | None = None
+
+作用：
+- 固定代码回答、Grounded LLM、Conversational LLM 和模板兜底全部统一结构。
+- final_answer 不再由节点散落拼接，而是统一从 GeneratedAnswer 渲染。
+- 支持测试、调试、前端分块展示和审计。
+
+======================================================================
+三、State 变化
+======================================================================
+
+AfcAgentState 新增：
+
+generated_answer: dict[str, Any]
+
+保留：
+
+final_answer: str
+
+职责：
+
+generated_answer
+- 保存结构化最终回答。
+
+final_answer
+- 通过 render_generated_answer() 生成 Markdown 字符串。
+- 保持原 API 字符串接口兼容。
+
+初始化位置：
+
+create_initial_state()
+_new_turn_state()
+
+均新增：
+
+"generated_answer": {}
+
+跨轮记忆字段保持不变：
+- messages
+- last_assetnum
+- last_route
+- last_business_goal
+- last_time_window
+- last_tool_results_summary
+- last_evidence_summary
+
+======================================================================
+四、四个 LLM 节点修改后的职责
+======================================================================
+
+---------------------------------------------------------------------
+4.1 understand_query
+---------------------------------------------------------------------
+
+修改前：
+- 同时输出语义理解和 needs_tools/needs_rag。
+- 风险等关键词容易让一般解释误判为缺设备编号。
+- Prompt 示例使用 JSON 数组，GLM 会模仿 input/output 包装。
+
+修改后：
+- 只负责语义理解。
+- 支持 conversation/general_explanation。
+- 支持 business_device/open_analysis。
+- 支持显式设备编号和 active_assetnum 上下文继承。
+- 规则兜底能够识别一般解释、开放组合分析和无关任务。
+- Prompt 全中文。
+- 示例改为普通文本分段。
+- 列出 Route 和 BusinessGoal 全部枚举。
+- 新增“当前高风险设备有哪些”正确全局路由示例。
+- 明确禁止 JSON array、input/output 包装、Markdown 和解释文字。
+- Prompt 末尾只有一个根对象骨架。
+
+真实验证：
+
+问题：当前高风险设备有哪些
+
+LLM 首次返回：
+
+{
+  "route": "business_global",
+  "business_goal": "high_risk_ranking",
+  "assetnum": null,
+  "time_window": null,
+  "needs_asset": false,
+  "context_used": false,
+  "information_need": "查询当前高风险设备",
+  "user_question_rewrite": "查询当前高风险设备排行",
+  "confidence": 0.95
+}
+
+结果：
+- 首次通过 QueryUnderstanding Pydantic 校验。
+- 未触发 repair。
+- 未使用规则兜底。
+- errors=[]。
+
+---------------------------------------------------------------------
+4.2 plan_tools
+---------------------------------------------------------------------
+
+修改前：
+- 固定业务也可能调用 LLM 规划。
+- 依赖 QueryUnderstanding.needs_tools/needs_rag。
+
+修改后：
+- 固定业务全部规则映射：
+  data_overview → get_data_summary_tool
+  high_risk_ranking → get_high_risk_devices_tool
+  device_risk → predict_device_risk_tool
+  device_history → get_device_history_tool
+  device_advice → get_maintenance_advice_tool
+  fault_type_prediction → predict_device_fault_type_tool
+  full_diagnosis → get_integrated_analysis_tool
+  manual_search → search_maintenance_manual_tool
+
+- conversation/general_explanation 不调用工具，answer_mode=conversational。
+- 只有 open_analysis 默认调用规划 LLM。
+- 补工具循环读取 EvidenceEvaluation.missing_evidence。
+- 过滤非白名单工具。
+- 过滤缺少 assetnum 的设备工具。
+- 不重复调用已成功且参数相同的工具。
+- 工具调用数量不超过 MAX_TOOL_CALLS。
+
+---------------------------------------------------------------------
+4.3 evaluate_evidence
+---------------------------------------------------------------------
+
+修改前：
+- 多数 evidence_based 请求都会尝试 LLM 评估。
+- answerable/need_more_tools 语义可能冲突。
+- 达到循环上限时可能把 answerable 强制改成 true。
+
+修改后：
+- 非 evidence_based 模式直接 proceed。
+- 固定业务完全规则评估。
+- 只有 open_analysis 使用 LLM 辅助评估。
+- 缺设备编号 → clarify。
+- 工具全部失败 → stop，evidence_sufficient=false。
+- 缺证据且循环未满 → replan。
+- 达到 MAX_TOOL_LOOPS=2 且仍缺证据 → stop，保持 evidence_sufficient=false。
+- LLM 失败后使用规则评估兜底。
+
+---------------------------------------------------------------------
+4.4 generate_answer
+---------------------------------------------------------------------
+
+修改前：
+- 部分回答直接返回字符串。
+- manual_search 强制模板。
+- Grounded 报告直接调用 llm.invoke() 返回自由文本。
+- 定义了 System Prompt，但调用时只发送 HumanMessage。
+- 科学边界通过关键词检测决定是否追加。
+
+修改后：
+- 所有出口先形成 GeneratedAnswer。
+- final_answer 统一由 render_generated_answer() 生成。
+- direct_chat/capability/clarification/unsupported 使用结构化代码构造。
+- 所有业务目标，包括 manual_search，优先调用 Grounded LLM。
+- AFC 一般解释使用独立 Conversational LLM。
+- 两种 LLM 均通过 call_llm_json() 和 GeneratedAnswer Pydantic 校验。
+- System Prompt 通过真正的 SystemMessage 发送。
+- report_builder 仅在 Grounded LLM 初始化、调用、解析或校验失败时兜底。
+- conversational 失败使用简洁代码兜底，不调用业务报告模板。
+
+统一 Markdown 渲染顺序：
+1. direct_answer
+2. 关键证据
+3. 分析
+4. 建议
+5. 来源
+6. 科学边界
+7. follow_up_question
+
+======================================================================
+五、科学边界与事实约束
+======================================================================
+
+默认边界说明：
+
+风险预测表示未来时间窗口内再次产生故障工单的可能性，不等同于精确预测物理故障日期；维修建议属于巡检方向参考，最终判断仍需结合现场检测、设备日志和人工经验。
+
+ensure_generated_answer() 当前执行：
+
+1. grounded 且 must_include_boundary=true 时，boundary_notice 不允许为空。
+2. 模型未提供边界时，由代码写入默认边界。
+3. sources 必须是 EvidencePacket.sources 的子集。
+4. 模型生成的不存在来源会被删除并记录 errors。
+5. 不再通过正文中是否出现“不代表”等关键词决定边界。
+
+Grounded LLM 约束：
+- 具体设备事实只能来自 EvidencePacket。
+- 不得编造设备编号、站点、风险值、故障类型、手册内容或来源。
+- 风险只能表述为未来时间窗口内再次产生故障工单的概率。
+- 不得预测精确故障日期。
+- 维修建议只能作为巡检方向。
+- evidence_sufficient=false 时必须说明证据不足。
+
+Conversational LLM 约束：
+- 可以使用 AFC 通用知识解释概念。
+- 不得编造当前设备状态。
+- 不得把一般知识说成某台设备事实。
+- 不得声称调用了未调用的工具。
+
+======================================================================
+六、LLM 配置变化
+======================================================================
+
+底层仍使用同一 OPENAI_MODEL、OPENAI_API_KEY 和 OPENAI_BASE_URL。
+
+当前三个懒加载实例：
+
+get_parse_llm()
+- temperature=0.0
+- 用于理解、开放规划和开放证据评估。
+
+get_report_llm()
+- temperature=0.2
+- 用于 Grounded 业务报告。
+
+get_conversation_llm()
+- temperature=0.5
+- 用于 AFC 一般解释和自由对话。
+
+没有引入新供应商或新 API Key。
+
+======================================================================
+七、LLM JSON 解析与 Repair 修改
+======================================================================
+
+统一链路：
+
+LLM 文本
+→ extract_json_from_text()
+→ parse_json_with_schema()
+→ schema.model_validate()
+→ 失败后最多两次 repair
+→ 每次 repair 后再次 Pydantic 校验
+→ 全部失败则节点使用既有规则或模板兜底
+
+诊断日志新增：
+- LLM 原始输出，使用 %r。
+- 第一次解析异常类型、消息和完整堆栈。
+- 每一次 repair 的完整原始输出。
+- 每次 repair 后的异常类型和堆栈。
+- Pydantic 字段级 errors()。
+- 模型名、Base URL、Base URL 类型和结构化输出方式。
+- 不打印 API Key。
+
+根数组处理修改：
+
+修改前：
+- json.loads() 得到 list 后继续扫描第一个大括号。
+- 可能把 [{"output": {...}}] 误提取成 {"output": {...}}。
+
+修改后：
+- 根节点为 list 时明确抛出：
+  期望 JSON object，实际收到 JSON array
+- 不再静默解包或扫描数组内部对象。
+
+Repair 串联修改：
+
+修改前：
+原始输出 → repair 1
+原始输出 → repair 2
+
+修改后：
+原始输出 → repair 1 输出 → repair 2
+
+通过 current_raw_output 和 current_error_message 串联。
+
+Repair Schema 修改：
+
+修改前：
+- 只提供字段名和 Python annotation。
+
+修改后：
+- 使用 target_schema.model_json_schema()。
+- 提供 required、enum、类型、null、additionalProperties 和嵌套结构。
+- 明确根节点必须为 object。
+- 明确禁止 array、input/output、Markdown 和解释文字。
+
+======================================================================
+八、Graph 和 API 兼容变化
+======================================================================
+
+条件边修改：
+
+修改前读取：
+evaluation["need_more_tools"]
+
+修改后读取：
+evaluation["decision"]
+
+规则：
+- decision == "replan" 且 tool_loop_count < MAX_TOOL_LOOPS → plan_tools
+- proceed/clarify/stop → generate_answer
+
+run_diagnosis 新增返回：
+
+"generated_answer": final_state.get("generated_answer", {})
+
+保持不变：
+- final_answer 仍为字符串。
+- 原有顶层 API 字段继续保留。
+- InMemorySaver 保留。
+- session_id 机制保留。
+- 最大工具循环次数保持 2。
+- 业务工具名称和参数不变。
+
+======================================================================
+九、新旧流程对比
+======================================================================
+
+修改前：
+
+用户问题
+→ LLM 理解（同时决定 needs_tools/needs_rag）
+→ 固定业务也可能调用 LLM 规划
+→ 工具执行
+→ 固定业务也可能调用 LLM 评估
+→ answerable/need_more_tools 控制流程
+→ manual_search 强制模板，其他报告可能自由文本输出
+→ 关键词判断是否补科学边界
+
+修改后：
+
+用户问题
+→ LLM 只做语义理解，失败走规则兜底
+→ 固定业务规则规划；open_analysis 才用 LLM 规划
+→ 工具执行
+→ merge_evidence 计算 available/expected/missing evidence
+→ 固定业务规则评估；open_analysis 才用 LLM 评估
+→ decision 控制流程，evidence_sufficient 表示证据充分性
+→ 所有回答先生成 GeneratedAnswer
+→ 统一校验、来源过滤和科学边界处理
+→ 统一渲染 Markdown final_answer
+
+======================================================================
+十、测试与验证
+======================================================================
+
+主要新增或更新测试：
+- tests/test_agent_structured_v04.py
+- tests/test_llm_json.py
+- tests/test_understand_prompt.py
+
+覆盖场景：
+- 闲聊、能力询问、缺设备编号、越界请求。
+- AFC 一般解释和 Conversation LLM。
+- 固定设备风险查询和 Grounded LLM。
+- Grounded SystemMessage 确实发送。
+- open_analysis 风险 + 历史规划。
+- 补工具循环读取 missing_evidence。
+- 不重复成功工具。
+- 工具全部失败 decision=stop。
+- 达到最大循环仍 evidence_sufficient=false。
+- manual_search LLM 主路径和模板兜底。
+- GeneratedAnswer 和统一 renderer。
+- 自动科学边界和来源过滤。
+- 多轮 active_assetnum。
+- JSON array 根节点拒绝。
+- 两次 repair 串联。
+- repair 使用完整 JSON Schema。
+- Prompt 不再包含 input/output 数组示例。
+
+截至后端 Agent 和 JSON 修复完成后的验证：
+
+pytest：204 passed
+文本完整性检查：passed
+
+注：之后项目中的前端独立测试会使仓库总测试数继续增长，但不属于本复盘范围。
+
+======================================================================
+十一、兼容性影响
+======================================================================
+
+无破坏性公开 API 变化：
+- final_answer 仍是字符串。
+- 原 API 路径和请求参数不变。
+- 新增 generated_answer 属于向后兼容扩展。
+- 工具、预测算法、数据处理和数据库未修改。
+- report_builder 未删除，只降级为异常兜底。
+
+内部数据契约变化：
+- QueryUnderstanding 删除 needs_tools/needs_rag。
+- ToolPlan.answer_policy 从 dict 改为 AnswerPolicy。
+- EvidenceEvaluation 改用 decision/evidence_sufficient。
+- 新增 GeneratedAnswer。
+
+这些属于 Agent 内部 State/Schema 调整；已有前端和 API 继续通过 final_answer、route、business_goal 等兼容字段工作。
+
+======================================================================
+十二、剩余风险与后续建议
+======================================================================
+
+1. Prompt 文本 JSON 仍不是供应商原生 response_format/json_schema。
+   当前本地 Pydantic + repair + 规则兜底保证跨供应商兼容。
+
+2. LLM 输出的自然语言事实无法只靠 Schema 完全证明真实。
+   已通过 EvidencePacket 隔离、来源过滤、Prompt 约束和模板兜底降低风险。
+
+3. open_analysis 的规划和综合解释质量仍依赖实际模型能力。
+   固定业务不依赖规划 LLM，可降低主要业务不稳定性。
+
+4. execute_tools 仍以工具名作为主要结果键。
+   当前单设备工作流适用；未来若支持单轮多设备，需要改为 tool_name + args 哈希。
+
+5. 建议后续增加真实模型的少量集成回归用例，但默认测试继续使用 Fake LLM，避免 CI 依赖外部服务。
+
+—— 复盘结束 ——

@@ -62,6 +62,7 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
         "fault_prediction": None,
         "data_overview": None,
         "high_risk_devices": None,
+        "available_evidence": [],
         "sources": [t.get("tool") for t in tool_trace if t.get("status") == "success"],
         "missing_evidence": [],
         "tool_errors": tool_errors,
@@ -149,39 +150,35 @@ def merge_evidence_node(state: AfcAgentState) -> dict[str, Any]:
     if isinstance(high_risk, dict) and high_risk.get("status") == "success":
         evidence_packet["high_risk_devices"] = high_risk.get("devices", [])
 
-    # ── 根据 query_understanding 初步判断缺失证据 ──
+    evidence_fields = (
+        "risk_prediction", "history_summary", "maintenance_advice",
+        "manual_evidence", "fault_prediction", "data_overview",
+        "high_risk_devices", "device_profile", "warning",
+    )
+    evidence_packet["available_evidence"] = [
+        name for name in evidence_fields if evidence_packet.get(name)
+    ]
+
+    # ── 根据当前工具计划计算预期与缺失证据 ──
     answer_mode = state.get("tool_plan", {}).get("answer_mode", "")
     # 只有 evidence_based 才需要检查缺失证据
     if answer_mode == "evidence_based":
-        route = query_understanding.get("route", "")
         business_goal = query_understanding.get("business_goal")
-        missing: list[str] = []
-
-        if business_goal in ("device_risk", "full_diagnosis") or route == "business_device":
-            if not evidence_packet["risk_prediction"] and business_goal in ("device_risk", "full_diagnosis"):
-                missing.append("risk_prediction")
-
-        if business_goal in ("device_advice", "full_diagnosis"):
-            if not evidence_packet["maintenance_advice"]:
-                missing.append("maintenance_advice")
-
-        if business_goal in ("device_history", "full_diagnosis"):
-            if not evidence_packet["history_summary"]:
-                missing.append("history_summary")
-
-        if business_goal == "manual_search":
-            if not evidence_packet["manual_evidence"]:
-                missing.append("manual_evidence")
-
-        if business_goal == "data_overview" and not evidence_packet["data_overview"]:
-            missing.append("data_overview")
-
-        if business_goal == "high_risk_ranking" and not evidence_packet["high_risk_devices"]:
-            missing.append("high_risk_devices")
-
-        if business_goal == "fault_type_prediction" and not evidence_packet["fault_prediction"]:
-            missing.append("fault_prediction")
-
-        evidence_packet["missing_evidence"] = missing
+        expected = []
+        for call in state.get("tool_plan", {}).get("tool_calls", []):
+            for item in call.get("expected_evidence", []):
+                if item not in expected:
+                    expected.append(item)
+        fallback = {
+            "device_risk": ["risk_prediction"], "device_history": ["history_summary"],
+            "device_advice": ["maintenance_advice"], "manual_search": ["manual_evidence"],
+            "fault_type_prediction": ["fault_prediction"], "data_overview": ["data_overview"],
+            "high_risk_ranking": ["high_risk_devices"],
+            "full_diagnosis": ["device_profile", "history_summary", "risk_prediction", "maintenance_advice"],
+        }
+        if not expected:
+            expected = fallback.get(business_goal, [])
+        available = set(evidence_packet["available_evidence"])
+        evidence_packet["missing_evidence"] = [item for item in expected if item not in available]
 
     return {"evidence_packet": evidence_packet}

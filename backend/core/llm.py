@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # ── 懒加载缓存 ──
 _PARSE_LLM: ChatOpenAI | None = None
 _REPORT_LLM: ChatOpenAI | None = None
+_CONVERSATION_LLM: ChatOpenAI | None = None
 
 
 def _create_chat_openai(temperature: float) -> ChatOpenAI:
@@ -63,5 +64,14 @@ def get_report_llm() -> ChatOpenAI:
     global _REPORT_LLM
     if _REPORT_LLM is None:
         logger.info("初始化 LLM 报告实例（model=%s）", OPENAI_MODEL)
-        _REPORT_LLM = _create_chat_openai(temperature=0.3)
+        _REPORT_LLM = _create_chat_openai(temperature=0.2)
     return _REPORT_LLM
+
+
+def get_conversation_llm() -> ChatOpenAI:
+    """用于 AFC 一般对话解释的 LLM（懒加载单例）。"""
+    global _CONVERSATION_LLM
+    if _CONVERSATION_LLM is None:
+        logger.info("初始化 LLM 对话实例（model=%s）", OPENAI_MODEL)
+        _CONVERSATION_LLM = _create_chat_openai(temperature=0.5)
+    return _CONVERSATION_LLM

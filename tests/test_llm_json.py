@@ -2,9 +2,12 @@
 
 import pytest
 
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 
 from backend.agent.llm_json import (
+    JSONExtractionError,
+    call_llm_json,
     extract_json_from_text,
     parse_json_with_schema,
 )
@@ -14,6 +17,18 @@ class _TestSchema(BaseModel):
     name: str
     value: int
     tags: list[str] = Field(default_factory=list)
+
+
+class _SequenceLLM:
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+        self.calls = []
+        self.model_name = "fake-model"
+        self.openai_api_base = "https://example.test/v1"
+
+    def invoke(self, messages):
+        self.calls.append(messages)
+        return AIMessage(content=next(self.outputs))
 
 
 class TestExtractJsonFromText:
@@ -79,6 +94,14 @@ class TestExtractJsonFromText:
         data = extract_json_from_text(text)
         assert data == {"first": 1}
 
+    def test_root_json_array_is_rejected_without_unwrapping(self):
+        with pytest.raises(JSONExtractionError, match="期望 JSON object，实际收到 JSON array"):
+            extract_json_from_text('[{"output": {"name": "wrapped"}}]')
+
+    def test_markdown_root_json_array_is_rejected(self):
+        with pytest.raises(JSONExtractionError, match="期望 JSON object，实际收到 JSON array"):
+            extract_json_from_text('```json\n[{"name": "wrapped"}]\n```')
+
 
 class TestParseJsonWithSchema:
 
@@ -109,3 +132,27 @@ class TestParseJsonWithSchema:
             _TestSchema,
         )
         assert result.value == 100
+
+
+def test_repair_rounds_chain_previous_repair_output_and_use_full_schema():
+    llm = _SequenceLLM([
+        '[{"name": "initial"}]',
+        '{"name": "repair-one"}',
+        '{"name": "repair-two", "value": 2, "tags": []}',
+    ])
+
+    result = call_llm_json(
+        llm=llm,
+        prompt="return test schema",
+        schema=_TestSchema,
+        max_repair_attempts=2,
+    )
+
+    assert result.name == "repair-two"
+    assert len(llm.calls) == 3
+    first_repair_prompt = llm.calls[1][1].content
+    second_repair_prompt = llm.calls[2][1].content
+    assert '"required"' in first_repair_prompt
+    assert '"properties"' in first_repair_prompt
+    assert '{"name": "repair-one"}' in second_repair_prompt
+    assert '[{"name": "initial"}]' not in second_repair_prompt

@@ -3,7 +3,7 @@
 流程（v0.3/v0.4）：
 START → prepare_context → understand_query → plan_tools → execute_tools
 → merge_evidence → evaluate_evidence
-  ├── need_more_tools 且 tool_loop_count < 2 → plan_tools（补充工具）
+  ├── decision=replan 且 tool_loop_count < 2 → plan_tools（补充工具）
   └── ready_to_answer → generate_answer
 → update_memory → END
 
@@ -36,7 +36,7 @@ def _should_get_more_tools(state: AfcAgentState) -> str:
     evaluation = state.get("evidence_evaluation", {})
     tool_loop_count = state.get("tool_loop_count", 0)
 
-    if evaluation.get("need_more_tools") and tool_loop_count < MAX_TOOL_LOOPS:
+    if evaluation.get("decision") == "replan" and tool_loop_count < MAX_TOOL_LOOPS:
         return "plan_tools"
     return "generate_answer"
 
@@ -98,6 +98,7 @@ def _new_turn_state(query: str) -> dict:
         "evidence_packet": {},
         "evidence_evaluation": {},
         "answer_policy": {},
+        "generated_answer": {},
         "final_answer": "",
         "memory_update": {},
         "tool_loop_count": 0,
@@ -180,6 +181,7 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
             "tool_trace": [],
             "evidence": {},
             "final_answer": f"Agent 工作流执行异常：{str(exc)}",
+            "generated_answer": {},
             "errors": [str(exc)],
             "session_id": session_id,
             "route": None,
@@ -210,6 +212,7 @@ def run_diagnosis(query: str, session_id: Optional[str] = None) -> dict:
         "tool_trace": tool_trace,
         "evidence": _api_evidence_from_packet(evidence_packet),
         "final_answer": final_state.get("final_answer", ""),
+        "generated_answer": final_state.get("generated_answer", {}),
         "errors": final_state.get("errors", []),
         "session_id": session_id,
         "last_assetnum": final_state.get("last_assetnum"),

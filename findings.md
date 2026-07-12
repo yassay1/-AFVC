@@ -1,95 +1,54 @@
-# 发现与决策：AFC Agent 文本完整性治理
+# 发现与决策：AFVC 八节点 Agent 重构
 
-## 需求边界
-- 目标是全项目文本完整性治理，不改变业务逻辑。
-- 修复范围包括中文乱码、替换字符、私用区字符、错误编码文本、不可读 docstring/注释/Prompt/工具描述/日志/错误消息/API 文案/前端文案/文档。
-- 文件编码目标是 UTF-8 strict 可解码。
-- 预防目标是新增自动扫描脚本、编辑器配置和测试集成。
+## 初始状态
+- 2026-07-12 开始审计。
+- 工作区预存未提交修改：`README.md`，本任务不回滚或覆盖。
 
-## 基线发现
+## 架构发现与实施决策
+- 原实现对固定业务也调用规划与评估 LLM；现改为固定目标规则映射，只有 open_analysis 使用相应 LLM。
+- 原 EvidenceEvaluation 混合“证据是否充分”和“下一步动作”；现拆为 evidence_sufficient 与 decision。
+- 原 generate_answer 直接调用模型文本输出，只发送 HumanMessage，manual_search 强制模板；现统一通过 call_llm_json、SystemMessage 和 GeneratedAnswer，模板仅异常兜底。
+- merge_evidence 保留原工具归一化逻辑，新增 available_evidence，并以 ToolPlan.expected_evidence 计算缺失证据。
+- run_diagnosis 保留全部旧字段和 final_answer 字符串，新增 generated_answer。
+- README.md 的工作区修改在任务开始前已存在，本任务未修改。
 
-### Git 状态
-工作区在本次治理开始前已有大量未提交变化，包括修改、删除和新增文件。本次治理遵循“不回滚用户已有改动”的原则，仅处理文本完整性相关文件和新增预防机制。
+## 验证
+- `python -m compileall -q backend tests`：通过。
+- `pytest -q`：193 passed。
+- `python scripts/check_text_integrity.py`：通过。
+- 生产代码残留扫描确认不再读取旧 needs_tools、needs_rag、answerable、need_more_tools、suggested_next_tools。
 
-### 编译与测试
-- `python -m compileall -f backend frontend tests`：通过。
-- `pytest`：184 passed。
+## 前端 UI 审计
+- 技术栈为 Streamlit，唯一入口是 `frontend/streamlit_app.py`，六个页面均由 `main()` 内的 sidebar radio 切换。
+- Agent 聊天已使用官方 `st.chat_message` 和 `st.chat_input`，必须在其上增强样式。
+- 会话状态使用 `st.session_state`；API 调用路径集中在同一文件的 requests 封装中。
+- LLM 开关真实变量为 `AFVC_USE_LLM`，应复用 `backend.core.config.is_llm_enabled()`。
+- 当前没有集中 CSS 模块，主题配置位于 `.streamlit/config.toml`。
+- UI 技能建议采用 transit blue、amber accent、浅灰背景、清晰焦点、44px 交互高度和 1280px 最大内容宽度；避免复杂阴影、渐变和装饰动画。
 
-### UTF-8 strict 解码
-- 扫描目标文本文件 74 个。
-- 非 UTF-8 文件：0 个。
-- 说明：当前问题主要是“UTF-8 文件中固化了错误解码后的乱码”，而不是文件本身无法用 UTF-8 解码。
+## 前端实施结果
+- 新增集中样式 `frontend/styles.py` 与展示组件 `frontend/ui_components.py`，避免 CSS 和枚举映射散落。
+- 六页面导航、所有 API 路径、请求体、session_state 键和官方聊天组件保持不变。
+- 首页不伪造统计值，仅展示能力说明、真实 LLM 模式和明确标注的路由展示示例。
+- 工作台将最新 route、business_goal、assetnum 映射为友好状态卡；原值和完整响应保留在底部折叠 Debug。
+- 未引入图标库；侧边栏使用纯 CSS AFC 字标，避免为少量图标增加依赖。
+- AppTest 验证六个导航页面无运行异常；AFVC_USE_LLM=false/true 均无异常。
 
-## 乱码分类
+## LLM JSON 失败复现（当前高风险设备有哪些）
+- 智谱 `glm-4-flash-250414` 三次请求均 HTTP 200，`AIMessage.content` 读取正常。
+- 首次输出和两次 repair 输出都是 JSON array，并模仿 Prompt 示例返回 `input/output` 包装；目标 Schema 要求根对象直接是 QueryUnderstanding。
+- 异常类型是 Pydantic SchemaValidationError，不是 JSONDecodeError；字段级错误为根字段缺失及 input/output extra_forbidden。
+- repair 循环第二次仍把最初 raw_output 作为修复对象，没有串联第一次 repair 输出。
+- 当前结构化方式不是 API native response_format，而是 Prompt 文本 JSON + 本地提取 + Pydantic + LLM repair；未发现 OpenAI-compatible 响应字段或协议不兼容。
 
-### 固化乱码
-- `backend/agent/tools.py`：工具 docstring、工具描述、错误消息、注释中存在严重乱码和私用区字符。
-- `task_plan.md`：过程记录文件整体乱码。
-- `findings.md`：过程记录文件整体乱码。
-- `progress.md`：过程记录文件整体乱码。
+## LLM 意图结构化修复结果
+- understand Prompt 已改为普通文本分段示例，新增全局高风险查询示例、完整枚举、根对象骨架和禁止包装约束。
+- JSON 根数组现在明确抛出 `期望 JSON object，实际收到 JSON array`，不再扫描内部包装对象。
+- repair 使用 Pydantic `model_json_schema()`，第二轮基于第一轮输出串联修复。
+- 真实 `glm-4-flash-250414` 对“当前高风险设备有哪些”首次返回无包装根对象，直接通过 QueryUnderstanding，errors 为空。
 
-### 私用区字符
-- `backend/agent/tools.py`
-- `task_plan.md`
-- `findings.md`
-- `progress.md`
-
-### 不可逆替换字符
-- 暂未发现 U+FFFD。
-
-### 非 UTF-8 文件
-- 暂未发现。
-
-### 扫描误报
-- `backend/agent/llm_json.py`：代码块提取正则包含反引号，属于正常代码。
-- `backend/agent/nodes/understand_query.py`：中文正则以 unicode escape 形式存在，属于正常代码。
-- `backend/agent/report_builder.py`：示例问题是正常中文文本。
-
-## 修复来源
-
-### 从 Git 历史恢复
-- `backend/agent/tools.py` 的原有工具文案来自 `HEAD:backend/agent/tools.py` 的可读版本。
-- `task_plan.md`、`findings.md`、`progress.md` 的历史内容可从 `HEAD` 读取为正常中文；本次未逐字恢复旧计划，而是基于可读版本重建为当前治理记录。
-
-### 按代码语义重写
-- `backend/agent/tools.py` 新增的 `predict_device_fault_type_tool` 不在旧版本中，按当前函数签名、服务调用和返回字段语义重写 docstring 与错误消息。
-- 根目录三份过程记录改写为本次治理计划、发现和进度记录。
-
-## 阶段结论
-
-### 阶段 1
-- 发现文件编码均可 UTF-8 解码。
-- 真实乱码问题集中，未发现需要盲目批量转码的证据。
-- 初始扫描的宽松模式会误报部分正常代码，最终脚本需要分级规则降低误报。
-
-### 阶段 2
-- `backend/agent/tools.py` 已修复。
-- 工具注册表、工具名称、参数、服务调用保持不变。
-- 验证：`tools.py` 私用区字符为 0，常见乱码片段命中 0，编译通过，测试 184 passed。
-
-### 阶段 3
-- `backend/api/` 和 `frontend/streamlit_app.py` 未发现乱码。
-- 未修改 API 或前端文件。
-- 验证：编译通过，测试 184 passed。
-
-### 阶段 4
-- `backend/services/`、`tests/`、`docs/`、`README.md` 未发现真实乱码。
-- `task_plan.md`、`findings.md`、`progress.md` 已恢复为可读文本并记录本次治理。
-
-## 待完成
-- 无待完成项。
-
-## 预防机制
-- `scripts/check_text_integrity.py`：检查 UTF-8 strict 解码、BOM、U+FFFD 替换字符、私用区字符、常见乱码强信号和 Python 文本读写缺少 `encoding="utf-8"` 的情况。
-- `.editorconfig`：设置 `charset = utf-8`、LF 换行、文件末尾换行。
-- `tests/test_text_integrity.py`：把文本完整性检查和 Agent 核心文案检查纳入默认 `pytest` 流程。
-
-## 最终验证
-- `python scripts/check_text_integrity.py`：passed。
-- `python -m compileall -f backend frontend tests`：passed。
-- `pytest`：186 passed。
-- Agent 冒烟测试：能力介绍、设备历史查询、设备风险查询、维修建议、高风险设备排行、缺少设备编号追问、API 422 错误提示和前端 Debug 文案均通过乱码检查。
-
-## 残留风险
-- 未发现残留乱码。
-- Windows PowerShell 控制台可能把正常 UTF-8 中文渲染为乱码；治理判断以文件 UTF-8 strict 解码和 Python 字符级检查为准。
+## Streamlit 加载提示生命周期修复
+- 原实现使用 `st.spinner` 后立即由提交入口 `st.rerun()`，没有显式 placeholder 或 processing 状态，前端可能保留上一轮 spinner delta。
+- 新增 `agent_is_processing` 防重复提交；加载文案仅写入 `st.empty()` placeholder。
+- `_handle_agent_query()` 使用 try/except/finally，无论成功、后端兜底响应、空响应、超时或异常，finally 都先置 False 再调用 placeholder.empty()。
+- 两个 st.rerun 调用均只在 handler 完整返回后执行；刷新时清除中断留下的 stale flag。

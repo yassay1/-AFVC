@@ -31,6 +31,7 @@ _ASSET_REQUIRED_TOOLS = {
     "predict_device_risk_tool",
     "get_device_history_tool",
     "get_maintenance_advice_tool",
+    "predict_device_fault_type_tool",
 }
 
 
